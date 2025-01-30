@@ -1,641 +1,369 @@
 //! GraphQL schema.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Instant;
 
-use apollo_parser::ast;
+use apollo_compiler::schema::Implementers;
+use apollo_compiler::validation::Valid;
+use apollo_compiler::Name;
+use apollo_federation::schema::ValidFederationSchema;
+use apollo_federation::ApiSchemaOptions;
+use apollo_federation::Supergraph;
 use http::Uri;
-use itertools::Itertools;
-use router_bridge::api_schema;
+use semver::Version;
+use semver::VersionReq;
 use sha2::Digest;
 use sha2::Sha256;
 
 use crate::error::ParseErrors;
 use crate::error::SchemaError;
-use crate::json_ext::Object;
-use crate::json_ext::Value;
 use crate::query_planner::OperationKind;
-use crate::*;
+use crate::uplink::schema::SchemaState;
+use crate::Configuration;
 
 /// A GraphQL schema.
-#[derive(Debug, Default, Clone)]
-pub struct Schema {
-    string: String,
-    subtype_map: HashMap<String, HashSet<String>>,
+pub(crate) struct Schema {
+    pub(crate) raw_sdl: Arc<String>,
+    supergraph: Supergraph,
     subgraphs: HashMap<String, Uri>,
-    pub(crate) object_types: HashMap<String, ObjectType>,
-    pub(crate) interfaces: HashMap<String, Interface>,
-    pub(crate) input_types: HashMap<String, InputObjectType>,
-    pub(crate) custom_scalars: HashSet<String>,
-    pub(crate) enums: HashMap<String, HashSet<String>>,
-    api_schema: Option<Box<Schema>>,
-    pub schema_id: Option<String>,
-    root_operations: HashMap<OperationKind, String>,
+    pub(crate) implementers_map: apollo_compiler::collections::HashMap<Name, Implementers>,
+    api_schema: ApiSchema,
+    pub(crate) schema_id: Arc<String>,
+    pub(crate) launch_id: Option<Arc<String>>,
 }
 
-impl std::str::FromStr for Schema {
-    type Err = SchemaError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut schema = parse(s)?;
-        schema.api_schema = Some(Box::new(api_schema(s)?));
-        return Ok(schema);
-
-        fn api_schema(schema: &str) -> Result<Schema, SchemaError> {
-            let api_schema = format!(
-                "{}\n",
-                api_schema::api_schema(schema)
-                    .map_err(|e| SchemaError::Api(e.to_string()))?
-                    .map_err(|e| {
-                        SchemaError::Api(e.iter().filter_map(|e| e.message.as_ref()).join(", "))
-                    })?
-            );
-
-            parse(&api_schema)
-        }
-
-        fn parse(schema: &str) -> Result<Schema, SchemaError> {
-            let schema_with_introspection = Schema::with_introspection(schema);
-            let parser = apollo_parser::Parser::new(&schema_with_introspection);
-            let tree = parser.parse();
-
-            // Trace log recursion limit data
-            let recursion_limit = tree.recursion_limit();
-            tracing::trace!(?recursion_limit, "recursion limit data");
-
-            let errors = tree.errors().cloned().collect::<Vec<_>>();
-
-            if !errors.is_empty() {
-                let errors = ParseErrors {
-                    raw_schema: schema.to_string(),
-                    errors,
-                };
-                errors.print();
-                return Err(SchemaError::Parse(errors));
-            }
-
-            let document = tree.document();
-            let mut subtype_map: HashMap<String, HashSet<String>> = Default::default();
-            let mut subgraphs = HashMap::new();
-            let mut root_operations = HashMap::new();
-
-            // the logic of this algorithm is inspired from the npm package graphql:
-            // https://github.com/graphql/graphql-js/blob/ac8f0c6b484a0d5dca2dc13c387247f96772580a/src/type/schema.ts#L302-L327
-            // https://github.com/graphql/graphql-js/blob/ac8f0c6b484a0d5dca2dc13c387247f96772580a/src/type/schema.ts#L294-L300
-            // https://github.com/graphql/graphql-js/blob/ac8f0c6b484a0d5dca2dc13c387247f96772580a/src/type/schema.ts#L215-L263
-            for definition in document.definitions() {
-                macro_rules! implements_interfaces {
-                    ($definition:expr) => {{
-                        let name = $definition
-                            .name()
-                            .expect("never optional according to spec; qed")
-                            .text()
-                            .to_string();
-
-                        for key in
-                            $definition
-                                .implements_interfaces()
-                                .iter()
-                                .flat_map(|member_types| {
-                                    member_types.named_types().flat_map(|x| x.name())
-                                })
-                        {
-                            let key = key.text().to_string();
-                            let set = subtype_map.entry(key).or_default();
-                            set.insert(name.clone());
-                        }
-                    }};
-                }
-
-                macro_rules! union_member_types {
-                    ($definition:expr) => {{
-                        let key = $definition
-                            .name()
-                            .expect("never optional according to spec; qed")
-                            .text()
-                            .to_string();
-                        let set = subtype_map.entry(key).or_default();
-
-                        for name in
-                            $definition
-                                .union_member_types()
-                                .iter()
-                                .flat_map(|member_types| {
-                                    member_types.named_types().flat_map(|x| x.name())
-                                })
-                        {
-                            set.insert(name.text().to_string());
-                        }
-                    }};
-                }
-
-                match definition {
-                    // Spec: https://spec.graphql.org/draft/#ObjectTypeDefinition
-                    ast::Definition::ObjectTypeDefinition(object) => implements_interfaces!(object),
-                    // Spec: https://spec.graphql.org/draft/#InterfaceTypeDefinition
-                    ast::Definition::InterfaceTypeDefinition(interface) => {
-                        implements_interfaces!(interface)
-                    }
-                    // Spec: https://spec.graphql.org/draft/#UnionTypeDefinition
-                    ast::Definition::UnionTypeDefinition(union) => union_member_types!(union),
-                    // Spec: https://spec.graphql.org/draft/#sec-Object-Extensions
-                    ast::Definition::ObjectTypeExtension(object) => implements_interfaces!(object),
-                    // Spec: https://spec.graphql.org/draft/#sec-Interface-Extensions
-                    ast::Definition::InterfaceTypeExtension(interface) => {
-                        implements_interfaces!(interface)
-                    }
-                    // Spec: https://spec.graphql.org/draft/#sec-Union-Extensions
-                    ast::Definition::UnionTypeExtension(union) => union_member_types!(union),
-                    // Spec: https://spec.graphql.org/draft/#sec-Enums
-                    ast::Definition::EnumTypeDefinition(enum_type) => {
-                        if enum_type
-                            .name()
-                            .and_then(|n| n.ident_token())
-                            .as_ref()
-                            .map(|id| id.text())
-                            == Some("join__Graph")
-                        {
-                            if let Some(enums) = enum_type.enum_values_definition() {
-                                for enum_kind in enums.enum_value_definitions() {
-                                    if let Some(directives) = enum_kind.directives() {
-                                        for directive in directives.directives() {
-                                            if directive
-                                                .name()
-                                                .and_then(|n| n.ident_token())
-                                                .as_ref()
-                                                .map(|id| id.text())
-                                                == Some("join__graph")
-                                            {
-                                                let mut name = None;
-                                                let mut url = None;
-
-                                                if let Some(arguments) = directive.arguments() {
-                                                    for argument in arguments.arguments() {
-                                                        let arg_name = argument
-                                                            .name()
-                                                            .and_then(|n| n.ident_token())
-                                                            .as_ref()
-                                                            .map(|id| id.text().to_owned());
-
-                                                        let arg_value: Option<String> =
-                                                            match argument.value() {
-                                                                // We are currently parsing name or url.
-                                                                // Both have to be strings.
-                                                                Some(ast::Value::StringValue(
-                                                                    sv,
-                                                                )) => Some(sv.into()),
-                                                                _ => None,
-                                                            };
-
-                                                        match arg_name.as_deref() {
-                                                            Some("name") => name = arg_value,
-                                                            Some("url") => url = arg_value,
-                                                            _ => {}
-                                                        };
-                                                    }
-                                                }
-                                                if let (Some(name), Some(url)) = (name, url) {
-                                                    if url.is_empty() {
-                                                        return Err(
-                                                            SchemaError::MissingSubgraphUrl(name),
-                                                        );
-                                                    }
-                                                    if subgraphs
-                                                        .insert(
-                                                            name.clone(),
-                                                            Uri::from_str(&url).map_err(|err| {
-                                                                SchemaError::UrlParse(
-                                                                    name.clone(),
-                                                                    err,
-                                                                )
-                                                            })?,
-                                                        )
-                                                        .is_some()
-                                                    {
-                                                        return Err(SchemaError::Api(format!("must not have several subgraphs with same name '{}'", name)));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Spec: https://spec.graphql.org/draft/#SchemaDefinition
-                    ast::Definition::SchemaDefinition(schema) => {
-                        for operation in schema.root_operation_type_definitions() {
-                            match (
-                                operation.operation_type(),
-                                operation.named_type().map(|n| {
-                                    n.name()
-                                        .expect("the node Name is not optional in the spec; qed")
-                                        .text()
-                                        .to_string()
-                                }),
-                            ) {
-                                (Some(optype), Some(name)) => {
-                                    root_operations.insert(optype.into(), name);
-                                }
-                                _ => {
-                                    return Err(SchemaError::Api("a field on the schema definition should have a name and operation type".to_string()));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            macro_rules! implement_object_type_or_interface_map {
-                ($ty:ty, $ast_ty:path, $ast_extension_ty:path $(,)?) => {{
-                    let mut map = document
-                        .definitions()
-                        .filter_map(|definition| {
-                            if let $ast_ty(definition) = definition {
-                                let instance = <$ty>::from(definition);
-                                Some((instance.name.clone(), instance))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<HashMap<String, $ty>>();
-
-                    document
-                        .definitions()
-                        .filter_map(|definition| {
-                            if let $ast_extension_ty(extension) = definition {
-                                Some(<$ty>::from(extension))
-                            } else {
-                                None
-                            }
-                        })
-                        .for_each(|extension| {
-                            if let Some(instance) = map.get_mut(&extension.name) {
-                                instance.fields.extend(extension.fields);
-                                instance.interfaces.extend(extension.interfaces);
-                            } else {
-                                failfast_debug!(
-                                    concat!(
-                                        "Extension exists for {:?} but ",
-                                        stringify!($ty),
-                                        " could not be found."
-                                    ),
-                                    extension.name,
-                                );
-                            }
-                        });
-
-                    map
-                }};
-            }
-
-            let object_types = implement_object_type_or_interface_map!(
-                ObjectType,
-                ast::Definition::ObjectTypeDefinition,
-                ast::Definition::ObjectTypeExtension,
-            );
-
-            let interfaces = implement_object_type_or_interface_map!(
-                Interface,
-                ast::Definition::InterfaceTypeDefinition,
-                ast::Definition::InterfaceTypeExtension,
-            );
-
-            macro_rules! implement_input_object_type_or_interface_map {
-                ($ty:ty, $ast_ty:path, $ast_extension_ty:path $(,)?) => {{
-                    let mut map = document
-                        .definitions()
-                        .filter_map(|definition| {
-                            if let $ast_ty(definition) = definition {
-                                let instance = <$ty>::from(definition);
-                                Some((instance.name.clone(), instance))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<HashMap<String, $ty>>();
-
-                    document
-                        .definitions()
-                        .filter_map(|definition| {
-                            if let $ast_extension_ty(extension) = definition {
-                                Some(<$ty>::from(extension))
-                            } else {
-                                None
-                            }
-                        })
-                        .for_each(|extension| {
-                            if let Some(instance) = map.get_mut(&extension.name) {
-                                instance.fields.extend(extension.fields);
-                            } else {
-                                failfast_debug!(
-                                    concat!(
-                                        "Extension exists for {:?} but ",
-                                        stringify!($ty),
-                                        " could not be found."
-                                    ),
-                                    extension.name,
-                                );
-                            }
-                        });
-
-                    map
-                }};
-            }
-
-            let input_types = implement_input_object_type_or_interface_map!(
-                InputObjectType,
-                ast::Definition::InputObjectTypeDefinition,
-                ast::Definition::InputObjectTypeExtension,
-            );
-
-            let custom_scalars = document
-                .definitions()
-                .filter_map(|definition| match definition {
-                    // Spec: https://spec.graphql.org/draft/#sec-Scalars
-                    // Spec: https://spec.graphql.org/draft/#sec-Scalar-Extensions
-                    ast::Definition::ScalarTypeDefinition(definition) => Some(
-                        definition
-                            .name()
-                            .expect("the node Name is not optional in the spec; qed")
-                            .text()
-                            .to_string(),
-                    ),
-                    ast::Definition::ScalarTypeExtension(extension) => Some(
-                        extension
-                            .name()
-                            .expect("the node Name is not optional in the spec; qed")
-                            .text()
-                            .to_string(),
-                    ),
-                    _ => None,
-                })
-                .collect();
-
-            let enums: HashMap<String, HashSet<String>> = document
-                .definitions()
-                .filter_map(|definition| match definition {
-                    // Spec: https://spec.graphql.org/draft/#sec-Enums
-                    ast::Definition::EnumTypeDefinition(definition) => {
-                        let name = definition
-                            .name()
-                            .expect("the node Name is not optional in the spec; qed")
-                            .text()
-                            .to_string();
-
-                        let enum_values: HashSet<String> = definition
-                            .enum_values_definition()
-                            .expect(
-                                "the node EnumValuesDefinition is not optional in the spec; qed",
-                            )
-                            .enum_value_definitions()
-                            .filter_map(|value| {
-                                value.enum_value().map(|val| {
-                                    //FIXME: should we check for true/false/null here
-                                    // https://spec.graphql.org/draft/#EnumValue
-                                    val.name()
-                                        .expect("the node Name is not optional in the spec; qed")
-                                        .text()
-                                        .to_string()
-                                })
-                            })
-                            .collect();
-
-                        Some((name, enum_values))
-                    }
-
-                    _ => None,
-                })
-                .collect();
-
-            let mut hasher = Sha256::new();
-            hasher.update(schema.as_bytes());
-            let schema_id = Some(format!("{:x}", hasher.finalize()));
-
-            Ok(Schema {
-                subtype_map,
-                string: schema.to_owned(),
-                subgraphs,
-                object_types,
-                input_types,
-                interfaces,
-                custom_scalars,
-                enums,
-                api_schema: None,
-                schema_id,
-                root_operations,
-            })
-        }
-    }
-}
+/// Wrapper type to distinguish from `Schema::definitions` for the supergraph schema
+#[derive(Debug)]
+pub(crate) struct ApiSchema(pub(crate) ValidFederationSchema);
 
 impl Schema {
-    /// Read a [`Schema`] from a file at a path.
-    pub fn read(path: impl AsRef<std::path::Path>) -> Result<Self, SchemaError> {
-        std::fs::read_to_string(path)?.parse()
+    pub(crate) fn parse(raw_sdl: &str, config: &Configuration) -> Result<Self, SchemaError> {
+        Self::parse_arc(raw_sdl.parse::<SchemaState>().unwrap().into(), config)
     }
 
-    /// Extracts a string slice containing the entire [`Schema`].
-    pub fn as_str(&self) -> &str {
-        &self.string
+    pub(crate) fn parse_arc(
+        raw_sdl: Arc<SchemaState>,
+        config: &Configuration,
+    ) -> Result<Self, SchemaError> {
+        let start = Instant::now();
+        let mut parser = apollo_compiler::parser::Parser::new();
+        let result = parser.parse_ast(&raw_sdl.sdl, "schema.graphql");
+
+        // Trace log recursion limit data
+        let recursion_limit = parser.recursion_reached();
+        tracing::trace!(?recursion_limit, "recursion limit data");
+
+        let definitions = result
+            .map_err(|invalid| {
+                SchemaError::Parse(ParseErrors {
+                    errors: invalid.errors,
+                })
+            })?
+            .to_schema_validate()
+            .map_err(|errors| SchemaError::Validate(errors.into()))?;
+
+        let mut subgraphs = HashMap::new();
+        // TODO: error if not found?
+        if let Some(join_enum) = definitions.get_enum("join__Graph") {
+            for (name, url) in join_enum.values.iter().filter_map(|(_name, value)| {
+                let join_directive = value.directives.get("join__graph")?;
+                let name = join_directive
+                    .specified_argument_by_name("name")?
+                    .as_str()?;
+                let url = join_directive.specified_argument_by_name("url")?.as_str()?;
+                Some((name, url))
+            }) {
+                if url.is_empty() {
+                    return Err(SchemaError::MissingSubgraphUrl(name.to_string()));
+                }
+                #[cfg(unix)]
+                // there is no standard for unix socket URLs apparently
+                let url = if let Some(path) = url.strip_prefix("unix://") {
+                    // there is no specified format for unix socket URLs (cf https://github.com/whatwg/url/issues/577)
+                    // so a unix:// URL will not be parsed by http::Uri
+                    // To fix that, hyperlocal came up with its own Uri type that can be converted to http::Uri.
+                    // It hides the socket path in a hex encoded authority that the unix socket connector will
+                    // know how to decode
+                    hyperlocal::Uri::new(path, "/").into()
+                } else {
+                    Uri::from_str(url)
+                        .map_err(|err| SchemaError::UrlParse(name.to_string(), err))?
+                };
+                #[cfg(not(unix))]
+                let url = Uri::from_str(url)
+                    .map_err(|err| SchemaError::UrlParse(name.to_string(), err))?;
+
+                if subgraphs.insert(name.to_string(), url).is_some() {
+                    return Err(SchemaError::Api(format!(
+                        "must not have several subgraphs with same name '{name}'"
+                    )));
+                }
+            }
+        }
+
+        f64_histogram!(
+            "apollo.router.schema.load.duration",
+            "Time spent loading the supergraph schema.",
+            start.elapsed().as_secs_f64()
+        );
+
+        let implementers_map = definitions.implementers_map();
+        let supergraph = Supergraph::from_schema(definitions)?;
+
+        let schema_id = Arc::new(Schema::schema_id(&raw_sdl.sdl));
+
+        let api_schema = supergraph
+            .to_api_schema(ApiSchemaOptions {
+                include_defer: config.supergraph.defer_support,
+                ..Default::default()
+            })
+            .map_err(|e| {
+                SchemaError::Api(format!(
+                    "The supergraph schema failed to produce a valid API schema: {e}"
+                ))
+            })?;
+
+        Ok(Schema {
+            launch_id: raw_sdl
+                .launch_id
+                .as_ref()
+                .map(ToString::to_string)
+                .map(Arc::new),
+            raw_sdl: Arc::new(raw_sdl.sdl.to_string()),
+            supergraph,
+            subgraphs,
+            implementers_map,
+            api_schema: ApiSchema(api_schema),
+            schema_id,
+        })
+    }
+
+    pub(crate) fn federation_supergraph(&self) -> &Supergraph {
+        &self.supergraph
+    }
+
+    pub(crate) fn supergraph_schema(&self) -> &Valid<apollo_compiler::Schema> {
+        self.supergraph.schema.schema()
+    }
+
+    pub(crate) fn schema_id(sdl: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(sdl.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Extracts a string containing the entire [`Schema`].
+    pub(crate) fn as_string(&self) -> &Arc<String> {
+        &self.raw_sdl
     }
 
     pub(crate) fn is_subtype(&self, abstract_type: &str, maybe_subtype: &str) -> bool {
-        self.subtype_map
-            .get(abstract_type)
-            .map(|x| x.contains(maybe_subtype))
+        self.supergraph_schema()
+            .is_subtype(abstract_type, maybe_subtype)
+    }
+
+    pub(crate) fn is_implementation(&self, interface: &str, implementor: &str) -> bool {
+        self.supergraph_schema()
+            .get_interface(interface)
+            .map(|interface| {
+                // FIXME: this looks backwards
+                interface.implements_interfaces.contains(implementor)
+            })
             .unwrap_or(false)
     }
 
-    /// Return an iterator over subgraphs that yields the subgraph name and its URL.
-    pub fn subgraphs(&self) -> impl Iterator<Item = (&String, &Uri)> {
-        self.subgraphs.iter()
+    pub(crate) fn is_interface(&self, abstract_type: &str) -> bool {
+        self.supergraph_schema()
+            .get_interface(abstract_type)
+            .is_some()
     }
 
-    pub fn api_schema(&self) -> &Schema {
-        match &self.api_schema {
-            Some(schema) => schema,
-            None => self,
+    // given two field, returns the one that implements the other, if applicable
+    pub(crate) fn most_precise<'f>(&self, a: &'f str, b: &'f str) -> Option<&'f str> {
+        let typename_a = a;
+        let typename_b = b;
+        if typename_a == typename_b {
+            return Some(a);
+        }
+        if self.is_subtype(typename_a, typename_b) || self.is_implementation(typename_a, typename_b)
+        {
+            Some(b)
+        } else if self.is_subtype(typename_b, typename_a)
+            || self.is_implementation(typename_b, typename_a)
+        {
+            Some(a)
+        } else {
+            // No relationship between a and b
+            None
         }
     }
 
-    pub fn boxed(self) -> Box<Self> {
-        Box::new(self)
+    /// Return an iterator over subgraphs that yields the subgraph name and its URL.
+    pub(crate) fn subgraphs(&self) -> impl Iterator<Item = (&String, &Uri)> {
+        self.subgraphs.iter()
     }
 
-    fn with_introspection(schema: &str) -> String {
-        format!(
-            "{}\n{}",
-            schema,
-            include_str!("introspection_types.graphql")
-        )
+    /// Return the subgraph URI given the service name
+    pub(crate) fn subgraph_url(&self, service_name: &str) -> Option<&Uri> {
+        self.subgraphs.get(service_name)
+    }
+
+    /// Return the API schema for this supergraph.
+    pub(crate) fn api_schema(&self) -> &ApiSchema {
+        &self.api_schema
     }
 
     pub(crate) fn root_operation_name(&self, kind: OperationKind) -> &str {
-        self.root_operations
-            .get(&kind)
-            .map(|s| s.as_str())
-            .unwrap_or_else(|| match kind {
-                OperationKind::Query => "Query",
-                OperationKind::Mutation => "Mutation",
-                OperationKind::Subscription => "SubScription",
+        if let Some(name) = self.supergraph_schema().root_operation(kind.into()) {
+            name.as_str()
+        } else {
+            kind.default_type_name()
+        }
+    }
+
+    /// Return the federation major version based on the @link or @core directives in the schema,
+    /// or None if there are no federation directives.
+    pub(crate) fn federation_version(&self) -> Option<i64> {
+        for directive in &self.supergraph_schema().schema_definition.directives {
+            let join_url = if directive.name == "core" {
+                let Some(feature) = directive
+                    .specified_argument_by_name("feature")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+
+                feature
+            } else if directive.name == "link" {
+                let Some(url) = directive
+                    .specified_argument_by_name("url")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+
+                url
+            } else {
+                continue;
+            };
+
+            match join_url.rsplit_once("/v") {
+                Some(("https://specs.apollo.dev/join", "0.1")) => return Some(1),
+                Some(("https://specs.apollo.dev/join", _)) => return Some(2),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    pub(crate) fn has_spec(&self, base_url: &str, expected_version_range: &str) -> bool {
+        self.supergraph_schema()
+            .schema_definition
+            .directives
+            .iter()
+            .filter(|dir| dir.name.as_str() == "link")
+            .any(|link| {
+                if let Some(url_in_link) = link
+                    .specified_argument_by_name("url")
+                    .and_then(|value| value.as_str())
+                {
+                    let Some((base_url_in_link, version_in_link)) = url_in_link.rsplit_once("/v")
+                    else {
+                        return false;
+                    };
+
+                    let Some(version_in_url) =
+                        Version::parse(format!("{}.0", version_in_link).as_str()).ok()
+                    else {
+                        return false;
+                    };
+
+                    let Some(version_range) = VersionReq::parse(expected_version_range).ok() else {
+                        return false;
+                    };
+
+                    base_url_in_link == base_url && version_range.matches(&version_in_url)
+                } else {
+                    false
+                }
+            })
+    }
+
+    pub(crate) fn directive_name(
+        schema: &apollo_compiler::schema::Schema,
+        base_url: &str,
+        expected_version_range: &str,
+        default: &str,
+    ) -> Option<String> {
+        schema
+            .schema_definition
+            .directives
+            .iter()
+            .filter(|dir| dir.name.as_str() == "link")
+            .find(|link| {
+                if let Some(url_in_link) = link
+                    .specified_argument_by_name("url")
+                    .and_then(|value| value.as_str())
+                {
+                    let Some((base_url_in_link, version_in_link)) = url_in_link.rsplit_once("/v")
+                    else {
+                        return false;
+                    };
+
+                    let Some(version_in_url) =
+                        Version::parse(format!("{}.0", version_in_link).as_str()).ok()
+                    else {
+                        return false;
+                    };
+
+                    let Some(version_range) = VersionReq::parse(expected_version_range).ok() else {
+                        return false;
+                    };
+
+                    base_url_in_link == base_url && version_range.matches(&version_in_url)
+                } else {
+                    false
+                }
+            })
+            .map(|link| {
+                link.specified_argument_by_name("as")
+                    .and_then(|value| value.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| default.to_string())
             })
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct InvalidObject;
-
-macro_rules! implement_object_type_or_interface {
-    ($visibility:vis $name:ident => $( $ast_ty:ty ),+ $(,)?) => {
-        #[derive(Debug, Clone)]
-        $visibility struct $name {
-            pub(crate) name: String,
-            fields: HashMap<String, FieldType>,
-            interfaces: Vec<String>,
-        }
-
-        impl $name {
-            pub(crate) fn field(&self, name: &str) -> Option<&FieldType> {
-                self.fields.get(name)
-            }
-        }
-
-        $(
-        impl From<$ast_ty> for $name {
-            fn from(definition: $ast_ty) -> Self {
-                let name = definition
-                    .name()
-                    .expect("the node Name is not optional in the spec; qed")
-                    .text()
-                    .to_string();
-                let fields = definition
-                    .fields_definition()
-                    .iter()
-                    .flat_map(|x| x.field_definitions())
-                    .map(|x| {
-                        let name = x
-                            .name()
-                            .expect("the node Name is not optional in the spec; qed")
-                            .text()
-                            .to_string();
-                        let ty = x
-                            .ty()
-                            .expect("the node Type is not optional in the spec; qed")
-                            .into();
-                        (name, ty)
-                    })
-                    .collect();
-                let interfaces = definition
-                    .implements_interfaces()
-                    .iter()
-                    .flat_map(|x| x.named_types())
-                    .map(|x| {
-                        x.name()
-                            .expect("neither Name neither NamedType are optionals; qed")
-                            .text()
-                            .to_string()
-                    })
-                    .collect();
-
-                $name {
-                    name,
-                    fields,
-                    interfaces,
-                }
-            }
-        }
-        )+
-    };
+impl std::fmt::Debug for Schema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            raw_sdl,
+            supergraph: _, // skip
+            subgraphs,
+            implementers_map,
+            api_schema: _, // skip
+            schema_id: _,  // skip
+            launch_id: _,  // skip
+        } = self;
+        f.debug_struct("Schema")
+            .field("raw_sdl", raw_sdl)
+            .field("subgraphs", subgraphs)
+            .field("implementers_map", implementers_map)
+            .finish()
+    }
 }
 
-// Spec: https://spec.graphql.org/draft/#sec-Objects
-// Spec: https://spec.graphql.org/draft/#sec-Object-Extensions
-implement_object_type_or_interface!(
-    pub(crate) ObjectType =>
-    ast::ObjectTypeDefinition,
-    ast::ObjectTypeExtension,
-);
-// Spec: https://spec.graphql.org/draft/#sec-Interfaces
-// Spec: https://spec.graphql.org/draft/#sec-Interface-Extensions
-implement_object_type_or_interface!(
-    pub(crate) Interface =>
-    ast::InterfaceTypeDefinition,
-    ast::InterfaceTypeExtension,
-);
+impl std::ops::Deref for ApiSchema {
+    type Target = Valid<apollo_compiler::Schema>;
 
-macro_rules! implement_input_object_type_or_interface {
-    ($visibility:vis $name:ident => $( $ast_ty:ty ),+ $(,)?) => {
-        #[derive(Debug, Clone)]
-        $visibility struct $name {
-            name: String,
-            fields: HashMap<String, FieldType>,
-        }
-
-        impl $name {
-            pub(crate) fn validate_object(
-                &self,
-                object: &Object,
-                schema: &Schema,
-            ) -> Result<(), InvalidObject> {
-                self
-                    .fields
-                    .iter()
-                    .try_for_each(|(name, ty)| {
-                        let value = object.get(name.as_str()).unwrap_or(&Value::Null);
-                        ty.validate_input_value(value, schema)
-                    })
-                    .map_err(|_| InvalidObject)
-            }
-        }
-
-        $(
-        impl From<$ast_ty> for $name {
-            fn from(definition: $ast_ty) -> Self {
-                let name = definition
-                    .name()
-                    .expect("the node Name is not optional in the spec; qed")
-                    .text()
-                    .to_string();
-                let fields = definition
-                    .input_fields_definition()
-                    .iter()
-                    .flat_map(|x| x.input_value_definitions())
-                    .map(|x| {
-                        let name = x
-                            .name()
-                            .expect("the node Name is not optional in the spec; qed")
-                            .text()
-                            .to_string();
-                        let ty = x
-                            .ty()
-                            .expect("the node Type is not optional in the spec; qed")
-                            .into();
-                        (name, ty)
-                    })
-                    .collect();
-
-                $name {
-                    name,
-                    fields,
-                }
-            }
-        }
-        )+
-    };
+    fn deref(&self) -> &Self::Target {
+        self.0.schema()
+    }
 }
-
-implement_input_object_type_or_interface!(
-    pub(crate) InputObjectType =>
-    ast::InputObjectTypeDefinition,
-    ast::InputObjectTypeExtension,
-);
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use super::*;
 
     fn with_supergraph_boilerplate(content: &str) -> String {
@@ -643,12 +371,23 @@ mod tests {
             "{}\n{}",
             r#"
         schema
-            @core(feature: "https://specs.apollo.dev/core/v0.1")
-            @core(feature: "https://specs.apollo.dev/join/v0.1") {
+            @link(url: "https://specs.apollo.dev/link/v1.0")
+            @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+        {
             query: Query
         }
-        directive @core(feature: String!) repeatable on SCHEMA
+        directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+        directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
         directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+        scalar link__Import
+        scalar join__FieldSet
+
+        enum link__Purpose {
+          SECURITY
+          EXECUTION
+        }
+
         enum join__Graph {
             TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
         }
@@ -679,7 +418,8 @@ mod tests {
             union UnionType2 = Foo | Bar
             "#,
             );
-            format!("{}\n{}", base_schema, schema).parse().unwrap()
+            let schema = format!("{base_schema}\n{schema}");
+            Schema::parse(&schema, &Default::default()).unwrap()
         }
 
         fn gen_schema_interfaces(schema: &str) -> Schema {
@@ -702,7 +442,8 @@ mod tests {
             interface InterfaceType2 implements Foo & Bar { me: String }
             "#,
             );
-            format!("{}\n{}", base_schema, schema).parse().unwrap()
+            let schema = format!("{base_schema}\n{schema}");
+            Schema::parse(&schema, &Default::default()).unwrap()
         }
         let schema = gen_schema_types("union UnionType = Foo | Bar | Baz");
         assert!(schema.is_subtype("UnionType", "Foo"));
@@ -737,29 +478,8 @@ mod tests {
 
     #[test]
     fn routing_urls() {
-        let schema: Schema = r#"
-        schema
-          @core(feature: "https://specs.apollo.dev/core/v0.1"),
-          @core(feature: "https://specs.apollo.dev/join/v0.1")
-        {
-          query: Query
-        }
-        type Query {
-          me: String
-        }
-        directive @core(feature: String!) repeatable on SCHEMA
-        directive @join__graph(name: String!, url: String!) on ENUM_VALUE
-
-        enum join__Graph {
-            ACCOUNTS @join__graph(name:"accounts" url: "http://localhost:4001/graphql")
-            INVENTORY
-              @join__graph(name: "inventory", url: "http://localhost:4004/graphql")
-            PRODUCTS
-            @join__graph(name: "products" url: "http://localhost:4003/graphql")
-            REVIEWS @join__graph(name: "reviews" url: "http://localhost:4002/graphql")
-        }"#
-        .parse()
-        .unwrap();
+        let schema = include_str!("../testdata/minimal_local_inventory_supergraph.graphql");
+        let schema = Schema::parse(schema, &Default::default()).unwrap();
 
         assert_eq!(schema.subgraphs.len(), 4);
         assert_eq!(
@@ -778,7 +498,7 @@ mod tests {
                 .get("inventory")
                 .map(|s| s.to_string())
                 .as_deref(),
-            Some("http://localhost:4004/graphql"),
+            Some("http://localhost:4002/graphql"),
             "Incorrect url for inventory"
         );
 
@@ -798,7 +518,7 @@ mod tests {
                 .get("reviews")
                 .map(|s| s.to_string())
                 .as_deref(),
-            Some("http://localhost:4002/graphql"),
+            Some("http://localhost:4004/graphql"),
             "Incorrect url for reviews"
         );
 
@@ -807,36 +527,48 @@ mod tests {
 
     #[test]
     fn api_schema() {
-        let schema = Schema::from_str(include_str!("../testdata/contract_schema.graphql")).unwrap();
-        assert!(schema.object_types["Product"]
-            .fields
-            .get("inStock")
-            .is_some());
-        assert!(schema.api_schema.unwrap().object_types["Product"]
-            .fields
-            .get("inStock")
-            .is_none());
+        let schema = include_str!("../testdata/contract_schema.graphql");
+        let schema = Schema::parse(schema, &Default::default()).unwrap();
+        let has_in_stock_field = |schema: &apollo_compiler::Schema| {
+            schema
+                .get_object("Product")
+                .unwrap()
+                .fields
+                .contains_key("inStock")
+        };
+        assert!(has_in_stock_field(schema.supergraph_schema()));
+        assert!(!has_in_stock_field(schema.api_schema()));
+    }
+
+    #[test]
+    fn federation_version() {
+        // @core directive
+        let schema = Schema::parse(
+            include_str!("../testdata/minimal_fed1_supergraph.graphql"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(schema.federation_version(), Some(1));
+
+        // @link directive
+        let schema = Schema::parse(
+            include_str!("../testdata/minimal_supergraph.graphql"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(schema.federation_version(), Some(2));
     }
 
     #[test]
     fn schema_id() {
         #[cfg(not(windows))]
         {
-            let schema =
-                Schema::from_str(include_str!("../testdata/starstuff@current.graphql")).unwrap();
+            let schema = include_str!("../testdata/starstuff@current.graphql");
+            let schema = Schema::parse(schema, &Default::default()).unwrap();
 
             assert_eq!(
-                schema.schema_id,
-                Some(
-                    "8e2021d131b23684671c3b85f82dfca836908c6a541bbd5c3772c66e7f8429d8".to_string()
-                )
-            );
-
-            assert_eq!(
-                schema.api_schema().schema_id,
-                Some(
-                    "ba573b479c8b3fa273f439b26b9eda700152341d897f18090d52cd073b15f909".to_string()
-                )
+                Schema::schema_id(&schema.raw_sdl),
+                "23bcf0ea13a4e0429c942bba59573ba70b8d6970d73ad00c5230d08788bb1ba2".to_string()
             );
         }
     }
@@ -844,14 +576,24 @@ mod tests {
     // test for https://github.com/apollographql/federation/pull/1769
     #[test]
     fn inaccessible_on_non_core() {
-        match Schema::from_str(include_str!("../testdata/inaccessible_on_non_core.graphql")) {
+        let schema = include_str!("../testdata/inaccessible_on_non_core.graphql");
+        match Schema::parse(schema, &Default::default()) {
             Err(SchemaError::Api(s)) => {
                 assert_eq!(
                     s,
-                    "The supergraph schema failed to produce a valid API schema"
+                    r#"The supergraph schema failed to produce a valid API schema: The following errors occurred:
+  - Input field `InputObject.privateField` is @inaccessible but is used in the default value of `@foo(someArg:)`, which is in the API schema."#
                 );
             }
-            other => panic!("unexpected schema result: {:?}", other),
+            other => panic!("unexpected schema result: {other:?}"),
         };
+    }
+
+    // https://github.com/apollographql/router/issues/2269
+    #[test]
+    fn unclosed_brace_error_does_not_panic() {
+        let schema = "schema {";
+        let result = Schema::parse(schema, &Default::default());
+        assert!(result.is_err());
     }
 }

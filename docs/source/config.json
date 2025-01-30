@@ -1,52 +1,17 @@
 {
-  "title": "Router",
-  "algoliaFilters": [
-    "docset:router"
-  ],
+  "title": "Self-Hosted Router",
+  "algoliaFilters": ["docset:router"],
   "sidebar": {
-    "Introduction": "/",
-    "Quickstart": "/quickstart",
-    "Moving from @apollo/gateway": "/migrating-from-gateway",
-    "Federation version support": "/federation-version-support",
-    "Configuration": {
-      "Overview": "/configuration/overview",
-      "CORS": "/configuration/cors",
-      "CSRF prevention": "/configuration/csrf",
-      "Logging": "/configuration/logging",
-      "Header propagation": "/configuration/header-propagation",
-      "Traffic shaping": "/configuration/traffic-shaping",
-      "Subgraph error inclusion (experimental)": "/configuration/subgraph-error-inclusion"
+    "Routing": {
+      "About Router": "/routing/about-router"
     },
-    "Monitoring & Metrics": {
-      "Health check": "/configuration/health-checks",
-      "Apollo Studio reporting": "/configuration/apollo-telemetry",
-      "Collecting metrics": "/configuration/metrics",
-      "Tracing": "/configuration/tracing"
-    },
-    "Containerization": {
-      "Overview": "/containerization/overview",
-      "Docker": "/containerization/docker",
-      "Kubernetes": "/containerization/kubernetes"
-    },
-    "Development Workflow": {
-      "Build and run queries": "/development-workflow/build-run-queries",
-      "Request format": "/development-workflow/requests",
-      "Apollo Studio Explorer": "https://www.apollographql.com/docs/studio/explorer/"
-    },
-    "Managed Federation": {
-      "Overview": "/managed-federation/overview",
-      "Setup": "/managed-federation/setup",
-      "Studio features": "https://www.apollographql.com/docs/studio/federated-graphs/"
-    },
-    "Customizations": {
-      "Overview": "/customizations/overview",
-      "Native Rust plugins": "/customizations/native",
-      "Custom binary": "/customizations/custom-binary",
-      "Rhai scripts": "/customizations/rhai"
-    },
-    "Subgraph Support": {
-      "Subgraph-compatible libraries": "https://www.apollographql.com/docs/federation/v2/other-servers/",
-      "Subgraph specification": "https://www.apollographql.com/docs/federation/v2/federation-spec/"
+    "Reference": {
+      "Migration": {
+        "From Gateway": "/reference/migration/from-gateway"
+      },
+      "Router": {
+        "Configuration": "/reference/router/configuration"
+      }
     }
   }
 }

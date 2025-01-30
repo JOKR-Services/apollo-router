@@ -24,6 +24,13 @@ If release name contains chart name it will be used as a full name.
 {{- end }}
 
 {{/*
+Create a name for our rhai config map.
+*/}}
+{{- define "router.rhaiConfigMapName" -}}
+{{- printf "%s-rhai" (include "router.fullname" .) }}
+{{- end }}
+
+{{/*
 Create chart name and version as used by the chart label.
 */}}
 {{- define "router.chart" -}}
@@ -75,12 +82,40 @@ https://github.com/bitnami/charts/blob/master/bitnami/common/templates/_tplvalue
 
 Renders a value that contains template.
 Usage:
-{{ include "common.tplvalues.render" ( dict "value" .Values.path.to.the.Value "context" $) }}
+{{ include "apollographql.tplvalues.render" ( dict "value" .Values.path.to.the.Value "context" $) }}
 */}}
-{{- define "common.tplvalues.render" -}}
+{{- define "apollographql.tplvalues.render" -}}
     {{- if typeIs "string" .value }}
         {{- tpl .value .context }}
     {{- else }}
         {{- tpl (.value | toYaml) .context }}
     {{- end }}
+{{- end -}}
+
+{{- define "router.prometheusMetricsPath" -}}
+{{/* NOTE: metrics configuration moved under telemetry.exporters in Router 1.35.0 */}}
+{{- if (((((.Values.router).configuration).telemetry).exporters).metrics).prometheus }}
+{{- .Values.router.configuration.telemetry.exporters.metrics.prometheus.path | quote }}
+{{- else if ((((.Values.router).configuration).telemetry).metrics).prometheus }}
+{{- .Values.router.configuration.telemetry.metrics.prometheus.path | quote }}
+{{- else -}}
+"/metrics"
+{{- end }}
+{{- end -}}
+
+{{/*
+This function takes the `extraLabels` map and templatizes the values.
+This allows to pass references from the values and interprates them as template.
+A use case for this usage is to add a custom label to the deployment referencing the version of the chart.
+For example:
+
+```
+extraLabels:
+  custom-version: {{ .Chart.AppVersion }}
+```
+*/}}
+{{- define "apollographql.templatizeExtraLabels" -}}
+{{- range $key, $value := .Values.extraLabels }}
+{{ printf "%s: %s" $key (include  "apollographql.tplvalues.render" ( dict "value" $value "context" $))}}
+{{- end -}}
 {{- end -}}

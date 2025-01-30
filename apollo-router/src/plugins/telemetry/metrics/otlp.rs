@@ -1,69 +1,49 @@
-use std::time::Duration;
-
-use futures::Stream;
-use futures::StreamExt;
-use opentelemetry::sdk::metrics::selectors;
-use opentelemetry::util::tokio_interval_stream;
-use opentelemetry::KeyValue;
-use opentelemetry_otlp::HttpExporterBuilder;
-use opentelemetry_otlp::TonicExporterBuilder;
+use opentelemetry::runtime;
+use opentelemetry::sdk::metrics::PeriodicReader;
+use opentelemetry::sdk::metrics::View;
+use opentelemetry_otlp::MetricsExporterBuilder;
 use tower::BoxError;
 
 use crate::plugins::telemetry::config::MetricsCommon;
+use crate::plugins::telemetry::metrics::CustomAggregationSelector;
 use crate::plugins::telemetry::metrics::MetricsBuilder;
 use crate::plugins::telemetry::metrics::MetricsConfigurator;
-
-// TODO Remove MetricExporterBuilder once upstream issue is fixed
-// This has to exist because Http is not currently supported for metrics export
-// https://github.com/open-telemetry/opentelemetry-rust/issues/772
-struct MetricExporterBuilder {
-    exporter: Option<TonicExporterBuilder>,
-}
-
-impl From<TonicExporterBuilder> for MetricExporterBuilder {
-    fn from(exporter: TonicExporterBuilder) -> Self {
-        Self {
-            exporter: Some(exporter),
-        }
-    }
-}
-
-impl From<HttpExporterBuilder> for MetricExporterBuilder {
-    fn from(_exporter: HttpExporterBuilder) -> Self {
-        Self { exporter: None }
-    }
-}
+use crate::plugins::telemetry::otlp::TelemetryDataKind;
 
 impl MetricsConfigurator for super::super::otlp::Config {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     fn apply(
         &self,
         mut builder: MetricsBuilder,
         metrics_config: &MetricsCommon,
     ) -> Result<MetricsBuilder, BoxError> {
-        let exporter: MetricExporterBuilder = self.exporter()?;
-        match exporter.exporter {
-            Some(exporter) => {
-                let exporter = opentelemetry_otlp::new_pipeline()
-                    .metrics(tokio::spawn, delayed_interval)
-                    .with_exporter(exporter)
-                    .with_aggregator_selector(selectors::simple::Selector::Exact)
-                    .with_resource(
-                        metrics_config
-                            .resources
-                            .clone()
-                            .into_iter()
-                            .map(|(k, v)| KeyValue::new(k, v)),
-                    )
-                    .build()?;
-                builder = builder.with_meter_provider(exporter.provider());
-                builder = builder.with_exporter(exporter);
-                Ok(builder)
-            }
-            None => Err("otlp metric export does not support http yet".into()),
+        if !self.enabled {
+            return Ok(builder);
         }
-    }
-}
+        let exporter_builder: MetricsExporterBuilder = self.exporter(TelemetryDataKind::Metrics)?;
+        let exporter = exporter_builder.build_metrics_exporter(
+            (&self.temporality).into(),
+            Box::new(
+                CustomAggregationSelector::builder()
+                    .boundaries(metrics_config.buckets.clone())
+                    .build(),
+            ),
+        )?;
 
-fn delayed_interval(duration: Duration) -> impl Stream<Item = tokio::time::Instant> {
-    tokio_interval_stream(duration).skip(1)
+        builder.public_meter_provider_builder = builder.public_meter_provider_builder.with_reader(
+            PeriodicReader::builder(exporter, runtime::Tokio)
+                .with_interval(self.batch_processor.scheduled_delay)
+                .with_timeout(self.batch_processor.max_export_timeout)
+                .build(),
+        );
+        for metric_view in metrics_config.views.clone() {
+            let view: Box<dyn View> = metric_view.try_into()?;
+            builder.public_meter_provider_builder =
+                builder.public_meter_provider_builder.with_view(view);
+        }
+        Ok(builder)
+    }
 }

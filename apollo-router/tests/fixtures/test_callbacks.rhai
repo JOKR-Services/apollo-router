@@ -10,13 +10,13 @@ fn router_service(service) {
     });
 }
 
-fn query_planner_service(service) {
-    log_info("query_planner_service setup");
+fn supergraph_service(service) {
+    log_info("supergraph_service setup");
     service.map_request(|request| {
-        log_info("from_query_planner_request");
+        log_info("from_supergraph_request");
     });
     service.map_response(|response| {
-        log_info("from_query_planner_response");
+        log_info("from_supergraph_response");
     });
 }
 

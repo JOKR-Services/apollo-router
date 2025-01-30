@@ -1,14 +1,15 @@
-name: CHANGELOG.md reminder
+name: NEXT_CHANGELOG.md reminder
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ dev ]
   workflow_dispatch:
 
 jobs:
   remind_missing_changelog:
     runs-on: ubuntu-latest
     steps:
-      - name: Missing Changelog Reminder
-        uses: mskelton/changelog-reminder-action@v2.0.0
+      - name: Missing NEXT_CHANGELOG.md Reminder
+        uses: mskelton/changelog-reminder-action@v3.0.0
         with:
-          changelogRegex: NEXT_CHANGELOG.md
+          changelogRegex: '\.changesets/(breaking|feat|fix|config|maint|docs|exp)_.*\.md'
+          message: "@${{ github.actor }}, please consider creating a changeset entry in `/.changesets/`. [These instructions](https://github.com/apollographql/router/blob/HEAD/.changesets/README.md) describe the process and tooling."

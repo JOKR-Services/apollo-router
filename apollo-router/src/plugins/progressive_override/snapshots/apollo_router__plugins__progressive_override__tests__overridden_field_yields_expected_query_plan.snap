@@ -1,0 +1,80 @@
+---
+source: apollo-router/src/plugins/progressive_override/tests.rs
+expression: query_plan
+---
+{
+  "data": {
+    "percent100": null
+  },
+  "extensions": {
+    "apolloQueryPlan": {
+      "object": {
+        "kind": "QueryPlan",
+        "node": {
+          "kind": "Sequence",
+          "nodes": [
+            {
+              "kind": "Fetch",
+              "serviceName": "Subgraph1",
+              "variableUsages": [],
+              "operation": "{ percent100 { __typename id } }",
+              "operationName": null,
+              "operationKind": "query",
+              "id": null,
+              "inputRewrites": null,
+              "outputRewrites": null,
+              "contextRewrites": null,
+              "schemaAwareHash": "df2a0633d70ab97805722bae920647da51b7eb821b06d8a2499683c5c7024316",
+              "authorization": {
+                "is_authenticated": false,
+                "scopes": [],
+                "policies": []
+              }
+            },
+            {
+              "kind": "Flatten",
+              "path": [
+                "percent100"
+              ],
+              "node": {
+                "kind": "Fetch",
+                "serviceName": "Subgraph2",
+                "requires": [
+                  {
+                    "kind": "InlineFragment",
+                    "typeCondition": "T",
+                    "selections": [
+                      {
+                        "kind": "Field",
+                        "name": "__typename"
+                      },
+                      {
+                        "kind": "Field",
+                        "name": "id"
+                      }
+                    ]
+                  }
+                ],
+                "variableUsages": [],
+                "operation": "query($representations: [_Any!]!) { _entities(representations: $representations) { ... on T { foo } } }",
+                "operationName": null,
+                "operationKind": "query",
+                "id": null,
+                "inputRewrites": null,
+                "outputRewrites": null,
+                "contextRewrites": null,
+                "schemaAwareHash": "56ac7a7cc11b7f293acbdaf0327cb2b676415eab8343e9259322a1609c90455e",
+                "authorization": {
+                  "is_authenticated": false,
+                  "scopes": [],
+                  "policies": []
+                }
+              }
+            }
+          ]
+        }
+      },
+      "text": "QueryPlan {\n  Sequence {\n    Fetch(service: \"Subgraph1\") {\n      {\n        percent100 {\n          __typename\n          id\n        }\n      }\n    },\n    Flatten(path: \"percent100\") {\n      Fetch(service: \"Subgraph2\") {\n        {\n          ... on T {\n            __typename\n            id\n          }\n        } =>\n        {\n          ... on T {\n            foo\n          }\n        }\n      },\n    },\n  },\n}"
+    }
+  }
+}

@@ -1,6 +1,5 @@
 ---
-source: apollo-router/src/query_planner/mod.rs
-assertion_line: 610
+source: apollo-router/src/query_planner/tests.rs
 expression: query_plan
 ---
 Sequence {
@@ -15,6 +14,18 @@ Sequence {
                     "topProducts_product_0",
                 ),
                 operation_kind: Query,
+                id: None,
+                input_rewrites: None,
+                output_rewrites: None,
+                context_rewrites: None,
+                schema_aware_hash: QueryHash(
+                    "",
+                ),
+                authorization: CacheKeyMetadata {
+                    is_authenticated: false,
+                    scopes: [],
+                    policies: [],
+                },
             },
         ),
         Parallel {
@@ -27,8 +38,11 @@ Sequence {
                                     [
                                         Key(
                                             "topProducts",
+                                            None,
                                         ),
-                                        Flatten,
+                                        Flatten(
+                                            None,
+                                        ),
                                     ],
                                 ),
                                 node: Fetch(
@@ -65,6 +79,18 @@ Sequence {
                                         operation: "query($representations:[_Any!]!){_entities(representations:$representations){...on Book{__typename isbn title year}}}",
                                         operation_name: None,
                                         operation_kind: Query,
+                                        id: None,
+                                        input_rewrites: None,
+                                        output_rewrites: None,
+                                        context_rewrites: None,
+                                        schema_aware_hash: QueryHash(
+                                            "",
+                                        ),
+                                        authorization: CacheKeyMetadata {
+                                            is_authenticated: false,
+                                            scopes: [],
+                                            policies: [],
+                                        },
                                     },
                                 ),
                             },
@@ -75,8 +101,11 @@ Sequence {
                                     [
                                         Key(
                                             "topProducts",
+                                            None,
                                         ),
-                                        Flatten,
+                                        Flatten(
+                                            None,
+                                        ),
                                     ],
                                 ),
                                 node: Fetch(
@@ -125,6 +154,18 @@ Sequence {
                                         operation: "query($representations:[_Any!]!){_entities(representations:$representations){...on Book{name}}}",
                                         operation_name: None,
                                         operation_kind: Query,
+                                        id: None,
+                                        input_rewrites: None,
+                                        output_rewrites: None,
+                                        context_rewrites: None,
+                                        schema_aware_hash: QueryHash(
+                                            "",
+                                        ),
+                                        authorization: CacheKeyMetadata {
+                                            is_authenticated: false,
+                                            scopes: [],
+                                            policies: [],
+                                        },
                                     },
                                 ),
                             },
@@ -139,6 +180,7 @@ Sequence {
                                     [
                                         Key(
                                             "product",
+                                            None,
                                         ),
                                     ],
                                 ),
@@ -174,6 +216,18 @@ Sequence {
                                         operation: "query($representations:[_Any!]!){_entities(representations:$representations){...on Book{__typename isbn title year}}}",
                                         operation_name: None,
                                         operation_kind: Query,
+                                        id: None,
+                                        input_rewrites: None,
+                                        output_rewrites: None,
+                                        context_rewrites: None,
+                                        schema_aware_hash: QueryHash(
+                                            "",
+                                        ),
+                                        authorization: CacheKeyMetadata {
+                                            is_authenticated: false,
+                                            scopes: [],
+                                            policies: [],
+                                        },
                                     },
                                 ),
                             },
@@ -184,6 +238,7 @@ Sequence {
                                     [
                                         Key(
                                             "product",
+                                            None,
                                         ),
                                     ],
                                 ),
@@ -233,6 +288,18 @@ Sequence {
                                         operation: "query($representations:[_Any!]!){_entities(representations:$representations){...on Book{name}}}",
                                         operation_name: None,
                                         operation_kind: Query,
+                                        id: None,
+                                        input_rewrites: None,
+                                        output_rewrites: None,
+                                        context_rewrites: None,
+                                        schema_aware_hash: QueryHash(
+                                            "",
+                                        ),
+                                        authorization: CacheKeyMetadata {
+                                            is_authenticated: false,
+                                            scopes: [],
+                                            policies: [],
+                                        },
                                     },
                                 ),
                             },

@@ -1,162 +1,171 @@
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
+use std::sync::Arc;
 
-use include_dir::include_dir;
-use once_cell::sync::Lazy;
-use router_bridge::introspect::IntrospectionError;
-use router_bridge::introspect::{self};
+use apollo_compiler::executable::Selection;
+use serde_json_bytes::json;
 
-use crate::graphql::Response;
-use crate::*;
+use crate::cache::storage::CacheStorage;
+use crate::compute_job;
+use crate::graphql;
+use crate::query_planner::QueryKey;
+use crate::services::layers::query_analysis::ParsedDocument;
+use crate::spec;
+use crate::Configuration;
 
-/// KNOWN_INTROSPECTION_QUERIES we will serve through Introspection.
-///
-/// If you would like to add one, put it in the "well_known_introspection_queries" folder.
-static KNOWN_INTROSPECTION_QUERIES: Lazy<Vec<String>> = Lazy::new(|| {
-    include_dir!("$CARGO_MANIFEST_DIR/well_known_introspection_queries")
-        .files()
-        .map(|file| {
-            file.contents_utf8()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "contents of the file at path {} isn't valid utf8",
-                        file.path().display()
-                    );
-                })
-                .to_string()
-        })
-        .collect()
-});
+const DEFAULT_INTROSPECTION_CACHE_CAPACITY: NonZeroUsize =
+    unsafe { NonZeroUsize::new_unchecked(5) };
 
-/// A cache containing our well known introspection queries.
-#[derive(Debug)]
-pub(crate) struct Introspection {
-    cache: HashMap<String, Response>,
+#[derive(Clone)]
+pub(crate) enum IntrospectionCache {
+    Disabled,
+    Enabled {
+        storage: Arc<CacheStorage<String, graphql::Response>>,
+    },
 }
 
-impl Introspection {
-    #[cfg(test)]
-    pub(crate) fn from_cache(cache: HashMap<String, Response>) -> Self {
-        Self { cache }
-    }
-
-    /// Create a `Introspection` from a `Schema`.
-    ///
-    /// This function will populate a cache in a blocking manner.
-    /// This is why `Introspection` instanciation happens in a spawn_blocking task on the state_machine side.
-    pub(crate) fn from_schema(schema: &Schema) -> Self {
-        let span = tracing::trace_span!("introspection_population");
-        let _guard = span.enter();
-
-        let cache = introspect::batch_introspect(
-            schema.as_str(),
-            KNOWN_INTROSPECTION_QUERIES.iter().cloned().collect(),
-        )
-        .map_err(|deno_runtime_error| {
-            tracing::warn!(
-                "router-bridge returned a deno runtime error:\n{}",
-                deno_runtime_error
-            );
-        })
-        .and_then(|global_introspection_result| {
-            global_introspection_result
-                .map_err(|general_introspection_error| {
-                    tracing::warn!(
-                        "Introspection returned an error:\n{}",
-                        general_introspection_error
-                    );
-                })
-                .map(|responses| {
-                    KNOWN_INTROSPECTION_QUERIES
-                        .iter()
-                        .zip(responses)
-                        .filter_map(|(query, response)| match response.into_result() {
-                            Ok(value) => {
-                                let response = Response::builder().data(value).build();
-                                Some((query.into(), response))
-                            }
-                            Err(graphql_errors) => {
-                                for error in graphql_errors {
-                                    tracing::warn!(
-                                        "Introspection returned error:\n{}\n{}",
-                                        error,
-                                        query
-                                    );
-                                }
-                                None
-                            }
-                        })
-                        .collect()
-                })
-        })
-        .unwrap_or_default();
-
-        Self { cache }
-    }
-
-    /// Execute an introspection and cache the response.
-    pub(crate) async fn execute(
-        &self,
-        schema_sdl: &str,
-        query: &str,
-    ) -> Result<Response, IntrospectionError> {
-        if let Some(response) = self.cache.get(query) {
-            return Ok(response.clone());
+impl IntrospectionCache {
+    pub(crate) fn new(configuration: &Configuration) -> Self {
+        if configuration.supergraph.introspection {
+            let storage = Arc::new(CacheStorage::new_in_memory(
+                DEFAULT_INTROSPECTION_CACHE_CAPACITY,
+                "introspection",
+            ));
+            storage.activate();
+            Self::Enabled { storage }
+        } else {
+            Self::Disabled
         }
-
-        // Do the introspection query and cache it
-        let mut response = introspect::batch_introspect(schema_sdl, vec![query.to_owned()])
-            .map_err(|err| IntrospectionError {
-                message: format!("Deno runtime error: {:?}", err).into(),
-            })??;
-        let introspection_result = response
-            .pop()
-            .ok_or_else(|| IntrospectionError {
-                message: String::from("cannot find the introspection response").into(),
-            })?
-            .into_result()
-            .map_err(|err| IntrospectionError {
-                message: format!(
-                    "introspection error : {}",
-                    err.into_iter()
-                        .map(|err| err.to_string())
-                        .collect::<Vec<String>>()
-                        .join(", "),
-                )
-                .into(),
-            })?;
-        let response = Response::builder().data(introspection_result).build();
-
-        Ok(response)
-    }
-}
-
-#[cfg(test)]
-mod introspection_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_plan() {
-        let query_to_test = "this is a test query";
-        let schema = " ";
-        let expected_data = Response::builder().data(42).build();
-
-        let cache = [(query_to_test.into(), expected_data.clone())]
-            .iter()
-            .cloned()
-            .collect();
-        let introspection = Introspection::from_cache(cache);
-
-        assert_eq!(
-            expected_data,
-            introspection.execute(schema, query_to_test).await.unwrap()
-        );
     }
 
-    #[test]
-    fn test_known_introspection_queries() {
-        // this only makes sure KNOWN_INTROSPECTION_QUERIES get created correctly.
-        // thus preventing regressions if a wrong query is added
-        // to the `well_known_introspection_queries` folder
-        let _ = &*KNOWN_INTROSPECTION_QUERIES;
+    pub(crate) fn activate(&self) {
+        match self {
+            IntrospectionCache::Disabled => {}
+            IntrospectionCache::Enabled { storage } => storage.activate(),
+        }
+    }
+
+    /// If `request` is a query with only introspection fields,
+    /// execute it and return a (cached) response
+    pub(crate) async fn maybe_execute(
+        &self,
+        schema: &Arc<spec::Schema>,
+        key: &QueryKey,
+        doc: &ParsedDocument,
+    ) -> ControlFlow<graphql::Response, ()> {
+        Self::maybe_lone_root_typename(schema, doc)?;
+        if doc.operation.is_query() {
+            if doc.has_schema_introspection {
+                if doc.has_explicit_root_fields {
+                    ControlFlow::Break(Self::mixed_fields_error())?;
+                } else {
+                    ControlFlow::Break(self.cached_introspection(schema, key, doc).await)?
+                }
+            } else if !doc.has_explicit_root_fields {
+                // root __typename only, probably a small query
+                // Execute it without caching:
+                ControlFlow::Break(Self::execute_introspection(schema, doc))?
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// A `{ __typename }` query is often used as a ping or health check.
+    /// Handle it without touching the cache.
+    ///
+    /// This fast path only applies if no fragment or directive is used,
+    /// so that we don’t have to deal with `@skip` or `@include` here.
+    fn maybe_lone_root_typename(
+        schema: &Arc<spec::Schema>,
+        doc: &ParsedDocument,
+    ) -> ControlFlow<graphql::Response, ()> {
+        if doc.operation.selection_set.selections.len() == 1 {
+            if let Selection::Field(field) = &doc.operation.selection_set.selections[0] {
+                if field.name == "__typename" && field.directives.is_empty() {
+                    // `{ alias: __typename }` is much less common so handling it here is not essential
+                    // but easier than a conditional to reject it
+                    let key = field.response_key().as_str();
+                    let object_type_name = schema
+                        .api_schema()
+                        .root_operation(doc.operation.operation_type)
+                        .expect("validation should have caught undefined root operation")
+                        .as_str();
+                    let data = json!({key: object_type_name});
+                    ControlFlow::Break(graphql::Response::builder().data(data).build())?
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn mixed_fields_error() -> graphql::Response {
+        let error = graphql::Error::builder()
+            .message(
+                "\
+                Mixed queries with both schema introspection and concrete fields \
+                are not supported yet: https://github.com/apollographql/router/issues/2789\
+            ",
+            )
+            .extension_code("MIXED_INTROSPECTION")
+            .build();
+        graphql::Response::builder().error(error).build()
+    }
+
+    async fn cached_introspection(
+        &self,
+        schema: &Arc<spec::Schema>,
+        key: &QueryKey,
+        doc: &ParsedDocument,
+    ) -> graphql::Response {
+        let storage = match self {
+            IntrospectionCache::Enabled { storage } => storage,
+            IntrospectionCache::Disabled => {
+                let error = graphql::Error::builder()
+                    .message(String::from("introspection has been disabled"))
+                    .extension_code("INTROSPECTION_DISABLED")
+                    .build();
+                return graphql::Response::builder().error(error).build();
+            }
+        };
+        let query = key.filtered_query.clone();
+        // TODO:  when adding support for variables in introspection queries,
+        // variable values should become part of the cache key.
+        // https://github.com/apollographql/router/issues/3831
+        let cache_key = query;
+        if let Some(response) = storage.get(&cache_key, |_| unreachable!()).await {
+            return response;
+        }
+        let schema = schema.clone();
+        let doc = doc.clone();
+        let priority = compute_job::Priority::P1; // Low priority
+        let response =
+            compute_job::execute(priority, move || Self::execute_introspection(&schema, &doc))
+                .await
+                .expect("Introspection panicked");
+        storage.insert(cache_key, response.clone()).await;
+        response
+    }
+
+    fn execute_introspection(schema: &spec::Schema, doc: &ParsedDocument) -> graphql::Response {
+        let schema = schema.api_schema();
+        let operation = &doc.operation;
+        let variable_values = Default::default();
+        match apollo_compiler::execution::coerce_variable_values(
+            schema,
+            operation,
+            &variable_values,
+        ) {
+            Ok(variable_values) => apollo_compiler::execution::execute_introspection_only_query(
+                schema,
+                &doc.executable,
+                operation,
+                &variable_values,
+            )
+            .into(),
+            Err(e) => {
+                let error = e.into_graphql_error(&doc.executable.sources);
+                graphql::Response::builder().error(error).build()
+            }
+        }
     }
 }

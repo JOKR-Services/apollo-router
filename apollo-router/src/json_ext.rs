@@ -1,17 +1,50 @@
+//! Performance oriented JSON manipulation.
+
+#![allow(missing_docs)] // FIXME
+
 use std::cmp::min;
 use std::fmt;
 
+use num_traits::ToPrimitive;
+use once_cell::sync::Lazy;
+use regex::Captures;
+use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json_bytes::ByteString;
 use serde_json_bytes::Entry;
 use serde_json_bytes::Map;
-pub use serde_json_bytes::Value;
+pub(crate) use serde_json_bytes::Value;
 
 use crate::error::FetchError;
+use crate::spec::Schema;
+use crate::spec::TYPENAME;
 
 /// A JSON object.
-pub type Object = Map<ByteString, Value>;
+pub(crate) type Object = Map<ByteString, Value>;
+
+const FRAGMENT_PREFIX: &str = "... on ";
+
+static TYPE_CONDITIONS_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\|\[(?<condition>.+?)?\]")
+        .expect("this regex to check for type conditions is valid")
+});
+
+/// Extract the condition list from the regex captures.
+fn extract_matched_conditions(caps: &Captures) -> TypeConditions {
+    caps.name("condition")
+        .map(|c| c.as_str().split(',').map(|s| s.to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn split_path_element_and_type_conditions(s: &str) -> (String, Option<TypeConditions>) {
+    let mut type_conditions = None;
+    let path_element = TYPE_CONDITIONS_REGEX.replace(s, |caps: &Captures| {
+        type_conditions = Some(extract_matched_conditions(caps));
+        ""
+    });
+    (path_element.to_string(), type_conditions)
+}
 
 macro_rules! extract_key_value_from_object {
     ($object:expr, $key:literal, $pattern:pat => $var:ident) => {{
@@ -29,6 +62,15 @@ macro_rules! extract_key_value_from_object {
     }};
 }
 
+macro_rules! ensure_array {
+    ($value:expr) => {{
+        match $value {
+            crate::json_ext::Value::Array(a) => Ok(a),
+            _ => Err("invalid type, expected an array"),
+        }
+    }};
+}
+
 macro_rules! ensure_object {
     ($value:expr) => {{
         match $value {
@@ -40,20 +82,28 @@ macro_rules! ensure_object {
 
 #[doc(hidden)]
 /// Extension trait for [`serde_json::Value`].
-pub trait ValueExt {
+pub(crate) trait ValueExt {
     /// Deep merge the JSON objects, array and override the values in `&mut self` if they already
     /// exists.
     #[track_caller]
     fn deep_merge(&mut self, other: Self);
 
+    /// Deep merge two JSON objects, overwriting values in `self` if it has the same key as `other`.
+    /// For GraphQL response objects, this uses schema information to avoid overwriting a concrete
+    /// `__typename` with an interface name.
+    #[track_caller]
+    fn type_aware_deep_merge(&mut self, other: Self, schema: &Schema);
+
     /// Returns `true` if the values are equal and the objects are ordered the same.
     ///
     /// **Note:** this is recursive.
+    #[cfg(test)]
     fn eq_and_ordered(&self, other: &Self) -> bool;
 
     /// Returns `true` if the set is a subset of another, i.e., `other` contains at least all the
     /// values in `self`.
     #[track_caller]
+    #[cfg(test)]
     fn is_subset(&self, superset: &Value) -> bool;
 
     /// Create a `Value` by inserting a value at a subpath.
@@ -64,24 +114,64 @@ pub trait ValueExt {
     #[track_caller]
     fn from_path(path: &Path, value: Value) -> Value;
 
-    /// Insert a `value` at a `Path`
+    /// Insert a `Value` at a `Path`
     #[track_caller]
     fn insert(&mut self, path: &Path, value: Value) -> Result<(), FetchError>;
+
+    /// Get a `Value` from a `Path`
+    #[track_caller]
+    fn get_path<'a>(&'a self, schema: &Schema, path: &'a Path) -> Result<&'a Value, FetchError>;
 
     /// Select all values matching a `Path`.
     ///
     /// the function passed as argument will be called with the values found and their Path
     /// if it encounters an invalid value, it will ignore it and continue
     #[track_caller]
-    fn select_values_and_paths<'a, F>(&'a self, path: &'a Path, f: F)
+    fn select_values_and_paths<'a, F>(&'a self, schema: &Schema, path: &'a Path, f: F)
     where
-        F: FnMut(Path, &'a Value);
+        F: FnMut(&Path, &'a Value);
+
+    /// Select all values matching a `Path`, and allows to mutate those values.
+    ///
+    /// The behavior of the method is otherwise the same as it's non-mutable counterpart
+    #[track_caller]
+    fn select_values_and_paths_mut<'a, F>(&'a mut self, schema: &Schema, path: &'a Path, f: F)
+    where
+        F: FnMut(&Path, &'a mut Value);
 
     #[track_caller]
     fn is_valid_float_input(&self) -> bool;
 
     #[track_caller]
     fn is_valid_int_input(&self) -> bool;
+
+    #[track_caller]
+    fn is_valid_id_input(&self) -> bool;
+
+    /// Returns whether this value is an object that matches the provided type.
+    ///
+    /// More precisely, this checks that this value is an object, looks at
+    /// its `__typename` field and checks if that  `__typename` is either
+    /// `maybe_type` or a subtype of it.
+    ///
+    /// If the value is not an object, this will always return `false`, but
+    /// if the value is an object with no `__typename` field, then we default
+    /// to `true` (meaning that the absences of way to check, we assume the
+    /// value is of your expected type).
+    ///
+    /// TODO: in theory, this later default behaviour shouldn't matter since
+    /// we should avoid calling this in cases where the `__typename` is
+    /// unknown, but it is currently *relied* on due to some not-quite-right
+    /// behaviour. See the comment in `ExecutionService.call` around the call
+    /// to `select_values_and_paths` for details (the later relies on this
+    /// function to handle `PathElement::Fragment`).
+    #[track_caller]
+    fn is_object_of_type(&self, schema: &Schema, maybe_type: &str) -> bool;
+
+    /// value type
+    fn json_type_name(&self) -> &'static str;
+
+    fn as_i32(&self) -> Option<i32>;
 }
 
 impl ValueExt for Value {
@@ -104,7 +194,7 @@ impl ValueExt for Value {
                     a_value.deep_merge(b_value);
                 }
 
-                a.extend(b.into_iter());
+                a.extend(b);
             }
             (_, Value::Null) => {}
             (Value::Object(_), Value::Array(_)) => {
@@ -121,6 +211,54 @@ impl ValueExt for Value {
         }
     }
 
+    fn type_aware_deep_merge(&mut self, other: Self, schema: &Schema) {
+        match (self, other) {
+            (Value::Object(a), Value::Object(b)) => {
+                for (key, value) in b.into_iter() {
+                    let k = key.clone();
+                    match a.entry(key) {
+                        Entry::Vacant(e) => {
+                            e.insert(value);
+                        }
+                        Entry::Occupied(e) => match (e.into_mut(), value) {
+                            (Value::String(type1), Value::String(type2))
+                                if k.as_str() == TYPENAME =>
+                            {
+                                // If type1 is a subtype of type2, we skip this overwrite to preserve the more specific `__typename`
+                                // in the response. Ideally, we could use `Schema::is_implementation`, but that looks to be buggy
+                                // and does not catch the problem we are trying to resolve.
+                                if !schema.is_subtype(type2.as_str(), type1.as_str()) {
+                                    *type1 = type2;
+                                }
+                            }
+                            (t, s) => t.type_aware_deep_merge(s, schema),
+                        },
+                    }
+                }
+            }
+            (Value::Array(a), Value::Array(mut b)) => {
+                for (b_value, a_value) in b.drain(..min(a.len(), b.len())).zip(a.iter_mut()) {
+                    a_value.type_aware_deep_merge(b_value, schema);
+                }
+
+                a.extend(b);
+            }
+            (_, Value::Null) => {}
+            (Value::Object(_), Value::Array(_)) => {
+                failfast_debug!("trying to replace an object with an array");
+            }
+            (Value::Array(_), Value::Object(_)) => {
+                failfast_debug!("trying to replace an array with an object");
+            }
+            (a, b) => {
+                if b != Value::Null {
+                    *a = b;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn eq_and_ordered(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Object(a), Value::Object(b)) => {
@@ -161,6 +299,7 @@ impl ValueExt for Value {
         }
     }
 
+    #[cfg(test)]
     fn is_subset(&self, superset: &Value) -> bool {
         match (self, superset) {
             (Value::Object(subset), Value::Object(superset)) => {
@@ -193,7 +332,8 @@ impl ValueExt for Value {
 
         for p in path.iter() {
             match p {
-                PathElement::Flatten => {
+                // Type conditions don't matter here since we're just creating a default value.
+                PathElement::Flatten(_) => {
                     return res_value;
                 }
 
@@ -223,7 +363,8 @@ impl ValueExt for Value {
                     }
                     other => unreachable!("unreachable node: {:?}", other),
                 },
-                PathElement::Key(k) => {
+                // Type conditions don't matter here since we're just creating a default value.
+                PathElement::Key(k, _) => {
                     let mut m = Map::new();
                     m.insert(k.as_str(), Value::default());
 
@@ -234,6 +375,7 @@ impl ValueExt for Value {
                         .get_mut(k.as_str())
                         .expect("the value at that key was just inserted");
                 }
+                PathElement::Fragment(_) => {}
             }
         }
 
@@ -241,14 +383,15 @@ impl ValueExt for Value {
         res_value
     }
 
-    /// Insert a `value` at a `Path`
+    /// Insert a `Value` at a `Path`
     #[track_caller]
-    fn insert(&mut self, path: &Path, value: Value) -> Result<(), FetchError> {
+    fn insert(&mut self, path: &Path, mut value: Value) -> Result<(), FetchError> {
         let mut current_node = self;
 
         for p in path.iter() {
             match p {
-                PathElement::Flatten => {
+                PathElement::Flatten(type_conditions) => {
+                    value = filter_type_conditions(value, type_conditions);
                     if current_node.is_null() {
                         let a = Vec::new();
                         *current_node = Value::Array(a);
@@ -288,29 +431,33 @@ impl ValueExt for Value {
                         })
                     }
                 },
-                PathElement::Key(k) => match current_node {
-                    Value::Object(o) => {
-                        current_node = o
-                            .get_mut(k.as_str())
-                            .expect("the value at that key was just inserted");
-                    }
-                    Value::Null => {
-                        let mut m = Map::new();
-                        m.insert(k.as_str(), Value::default());
+                PathElement::Key(k, type_conditions) => {
+                    value = filter_type_conditions(value, type_conditions);
+                    match current_node {
+                        Value::Object(o) => {
+                            current_node = o
+                                .get_mut(k.as_str())
+                                .expect("the value at that key was just inserted");
+                        }
+                        Value::Null => {
+                            let mut m = Map::new();
+                            m.insert(k.as_str(), Value::default());
 
-                        *current_node = Value::Object(m);
-                        current_node = current_node
-                            .as_object_mut()
-                            .expect("current_node was just set to a Value::Object")
-                            .get_mut(k.as_str())
-                            .expect("the value at that key was just inserted");
+                            *current_node = Value::Object(m);
+                            current_node = current_node
+                                .as_object_mut()
+                                .expect("current_node was just set to a Value::Object")
+                                .get_mut(k.as_str())
+                                .expect("the value at that key was just inserted");
+                        }
+                        _other => {
+                            return Err(FetchError::ExecutionPathNotFound {
+                                reason: "expected an object".to_string(),
+                            })
+                        }
                     }
-                    _other => {
-                        return Err(FetchError::ExecutionPathNotFound {
-                            reason: "expected an object".to_string(),
-                        })
-                    }
-                },
+                }
+                PathElement::Fragment(_) => {}
             }
         }
 
@@ -318,12 +465,49 @@ impl ValueExt for Value {
         Ok(())
     }
 
+    /// Get a `Value` from a `Path`
     #[track_caller]
-    fn select_values_and_paths<'a, F>(&'a self, path: &'a Path, mut f: F)
+    fn get_path<'a>(&'a self, schema: &Schema, path: &'a Path) -> Result<&'a Value, FetchError> {
+        let mut res = Err(FetchError::ExecutionPathNotFound {
+            reason: "value not found".to_string(),
+        });
+        iterate_path(
+            schema,
+            &mut Path::default(),
+            &path.0,
+            self,
+            &mut |_path, value| {
+                res = Ok(value);
+            },
+        );
+        res
+    }
+
+    #[track_caller]
+    fn select_values_and_paths<'a, F>(&'a self, schema: &Schema, path: &'a Path, mut f: F)
     where
-        F: FnMut(Path, &'a Value),
+        F: FnMut(&Path, &'a Value),
     {
-        iterate_path(&Path::default(), &path.0, self, &mut f)
+        iterate_path(schema, &mut Path::default(), &path.0, self, &mut f)
+    }
+
+    #[track_caller]
+    fn select_values_and_paths_mut<'a, F>(&'a mut self, schema: &Schema, path: &'a Path, mut f: F)
+    where
+        F: FnMut(&Path, &'a mut Value),
+    {
+        iterate_path_mut(schema, &mut Path::default(), &path.0, self, &mut f)
+    }
+
+    #[track_caller]
+    fn is_valid_id_input(&self) -> bool {
+        // https://spec.graphql.org/October2021/#sec-ID.Input-Coercion
+        match self {
+            // Any string and integer values are accepted
+            Value::String(_) => true,
+            Value::Number(n) => n.is_i64() || n.is_u64(),
+            _ => false,
+        }
     }
 
     #[track_caller]
@@ -332,11 +516,8 @@ impl ValueExt for Value {
         match self {
             // When expected as an input type, both integer and float input values are accepted.
             Value::Number(n) if n.is_f64() => true,
-            // The Int scalar type represents a signed 32-bit numeric non-fractional value.
-            Value::Number(n) => n
-                .as_i64()
-                .map(|as_number| i32::try_from(as_number).is_ok())
-                .unwrap_or_default(),
+            // Integer input values are coerced to Float by adding an empty fractional part, for example 1.0 for the integer input value 1.
+            Value::Number(n) => n.is_i64(),
             // All other input values, including strings with numeric content, must raise a request error indicating an incorrect type.
             _ => false,
         }
@@ -351,42 +532,273 @@ impl ValueExt for Value {
         self.as_i64().and_then(|x| i32::try_from(x).ok()).is_some()
             || self.as_u64().and_then(|x| i32::try_from(x).ok()).is_some()
     }
+
+    #[track_caller]
+    fn is_object_of_type(&self, schema: &Schema, maybe_type: &str) -> bool {
+        self.is_object()
+            && self
+                .get(TYPENAME)
+                .and_then(|v| v.as_str())
+                .map_or(true, |typename| {
+                    typename == maybe_type || schema.is_subtype(maybe_type, typename)
+                })
+    }
+
+    fn json_type_name(&self) -> &'static str {
+        match self {
+            Value::Array(_) => "array",
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Object(_) => "object",
+        }
+    }
+
+    fn as_i32(&self) -> Option<i32> {
+        self.as_i64()?.to_i32()
+    }
 }
 
-fn iterate_path<'a, F>(parent: &Path, path: &'a [PathElement], data: &'a Value, f: &mut F)
-where
-    F: FnMut(Path, &'a Value),
+fn filter_type_conditions(value: Value, type_conditions: &Option<TypeConditions>) -> Value {
+    if let Some(tc) = type_conditions {
+        match value {
+            Value::Object(ref o) => {
+                if let Some(Value::String(type_name)) = &o.get("__typename") {
+                    if !tc.iter().any(|tc| tc.as_str() == type_name.as_str()) {
+                        return Value::Null;
+                    }
+                }
+            }
+            Value::Array(v) => {
+                return Value::Array(
+                    v.into_iter()
+                        .map(|v| filter_type_conditions(v, type_conditions))
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    value
+}
+
+fn iterate_path<'a, F>(
+    schema: &Schema,
+    parent: &mut Path,
+    path: &'a [PathElement],
+    data: &'a Value,
+    f: &mut F,
+) where
+    F: FnMut(&Path, &'a Value),
 {
-    match path.get(0) {
-        None => f(parent.clone(), data),
-        Some(PathElement::Flatten) => {
+    match path.first() {
+        None => f(parent, data),
+        Some(PathElement::Flatten(type_conditions)) => {
             if let Some(array) = data.as_array() {
                 for (i, value) in array.iter().enumerate() {
-                    iterate_path(
-                        &parent.join(Path::from(i.to_string())),
-                        &path[1..],
-                        value,
-                        f,
-                    );
+                    if let Some(tc) = type_conditions {
+                        if !tc.is_empty() {
+                            if let Value::Object(o) = value {
+                                if let Some(Value::String(type_name)) = o.get("__typename") {
+                                    if tc.iter().any(|tc| tc.as_str() == type_name.as_str()) {
+                                        parent.push(PathElement::Index(i));
+                                        iterate_path(schema, parent, &path[1..], value, f);
+                                        parent.pop();
+                                    }
+                                }
+                            }
+
+                            if let Value::Array(array) = value {
+                                for (i, value) in array.iter().enumerate() {
+                                    if let Value::Object(o) = value {
+                                        if let Some(Value::String(type_name)) = o.get("__typename")
+                                        {
+                                            if tc.iter().any(|tc| tc.as_str() == type_name.as_str())
+                                            {
+                                                parent.push(PathElement::Index(i));
+                                                iterate_path(schema, parent, &path[1..], value, f);
+                                                parent.pop();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        parent.push(PathElement::Index(i));
+                        iterate_path(schema, parent, &path[1..], value, f);
+                        parent.pop();
+                    }
                 }
             }
         }
         Some(PathElement::Index(i)) => {
             if let Value::Array(a) = data {
                 if let Some(value) = a.get(*i) {
-                    iterate_path(
-                        &parent.join(Path::from(i.to_string())),
-                        &path[1..],
-                        value,
-                        f,
-                    )
+                    parent.push(PathElement::Index(*i));
+                    iterate_path(schema, parent, &path[1..], value, f);
+                    parent.pop();
                 }
             }
         }
-        Some(PathElement::Key(k)) => {
-            if let Value::Object(o) = data {
+        Some(PathElement::Key(k, type_conditions)) => {
+            if let Some(tc) = type_conditions {
+                if !tc.is_empty() {
+                    if let Value::Object(o) = data {
+                        if let Some(value) = o.get(k.as_str()) {
+                            if let Some(Value::String(type_name)) = value.get("__typename") {
+                                if tc.iter().any(|tc| tc.as_str() == type_name.as_str()) {
+                                    parent.push(PathElement::Key(k.to_string(), None));
+                                    iterate_path(schema, parent, &path[1..], value, f);
+                                    parent.pop();
+                                }
+                            }
+                        }
+                    } else if let Value::Array(array) = data {
+                        for (i, value) in array.iter().enumerate() {
+                            if let Value::Object(o) = value {
+                                if let Some(Value::String(type_name)) = o.get("__typename") {
+                                    if tc.iter().any(|tc| tc.as_str() == type_name.as_str()) {
+                                        parent.push(PathElement::Index(i));
+                                        iterate_path(schema, parent, path, value, f);
+                                        parent.pop();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Value::Object(o) = data {
                 if let Some(value) = o.get(k.as_str()) {
-                    iterate_path(&parent.join(Path::from(k)), &path[1..], value, f)
+                    parent.push(PathElement::Key(k.to_string(), None));
+                    iterate_path(schema, parent, &path[1..], value, f);
+                    parent.pop();
+                }
+            } else if let Value::Array(array) = data {
+                for (i, value) in array.iter().enumerate() {
+                    parent.push(PathElement::Index(i));
+                    iterate_path(schema, parent, path, value, f);
+                    parent.pop();
+                }
+            }
+        }
+        Some(PathElement::Fragment(name)) => {
+            if data.is_object_of_type(schema, name) {
+                // Note that (not unlike `Flatten`) we do not include the fragment in the `parent`
+                // path, because we want that path to be a "pure" response path. Fragments in path
+                // are used to essentially create a type-based choice in a "selection" path, but
+                // `parent` is a direct path to a specific position in the value and do not need
+                // fragments.
+                iterate_path(schema, parent, &path[1..], data, f);
+            } else if let Value::Array(array) = data {
+                for (i, value) in array.iter().enumerate() {
+                    parent.push(PathElement::Index(i));
+                    iterate_path(schema, parent, path, value, f);
+                    parent.pop();
+                }
+            }
+        }
+    }
+}
+
+fn iterate_path_mut<'a, F>(
+    schema: &Schema,
+    parent: &mut Path,
+    path: &'a [PathElement],
+    data: &'a mut Value,
+    f: &mut F,
+) where
+    F: FnMut(&Path, &'a mut Value),
+{
+    match path.first() {
+        None => f(parent, data),
+        Some(PathElement::Flatten(type_conditions)) => {
+            if let Some(array) = data.as_array_mut() {
+                for (i, value) in array.iter_mut().enumerate() {
+                    if let Some(tc) = type_conditions {
+                        if !tc.is_empty() {
+                            if let Value::Object(o) = value {
+                                if let Some(Value::String(type_name)) = o.get("__typename") {
+                                    if tc.iter().any(|tc| tc.as_str() == type_name.as_str()) {
+                                        parent.push(PathElement::Index(i));
+                                        iterate_path_mut(schema, parent, &path[1..], value, f);
+                                        parent.pop();
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        parent.push(PathElement::Index(i));
+                        iterate_path_mut(schema, parent, &path[1..], value, f);
+                        parent.pop();
+                    }
+                }
+            }
+        }
+        Some(PathElement::Index(i)) => {
+            if let Value::Array(a) = data {
+                if let Some(value) = a.get_mut(*i) {
+                    parent.push(PathElement::Index(*i));
+                    iterate_path_mut(schema, parent, &path[1..], value, f);
+                    parent.pop();
+                }
+            }
+        }
+        Some(PathElement::Key(k, type_conditions)) => {
+            if let Some(tc) = type_conditions {
+                if !tc.is_empty() {
+                    if let Value::Object(o) = data {
+                        if let Some(value) = o.get_mut(k.as_str()) {
+                            if let Some(Value::String(type_name)) = value.get("__typename") {
+                                if tc.iter().any(|tc| tc.as_str() == type_name.as_str()) {
+                                    parent.push(PathElement::Key(k.to_string(), None));
+                                    iterate_path_mut(schema, parent, &path[1..], value, f);
+                                    parent.pop();
+                                }
+                            }
+                        }
+                    } else if let Value::Array(array) = data {
+                        for (i, value) in array.iter_mut().enumerate() {
+                            if let Value::Object(o) = value {
+                                if let Some(Value::String(type_name)) = o.get("__typename") {
+                                    if tc.iter().any(|tc| tc.as_str() == type_name.as_str()) {
+                                        parent.push(PathElement::Index(i));
+                                        iterate_path_mut(schema, parent, path, value, f);
+                                        parent.pop();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Value::Object(o) = data {
+                if let Some(value) = o.get_mut(k.as_str()) {
+                    parent.push(PathElement::Key(k.to_string(), None));
+                    iterate_path_mut(schema, parent, &path[1..], value, f);
+                    parent.pop();
+                }
+            } else if let Value::Array(array) = data {
+                for (i, value) in array.iter_mut().enumerate() {
+                    parent.push(PathElement::Index(i));
+                    iterate_path_mut(schema, parent, path, value, f);
+                    parent.pop();
+                }
+            }
+        }
+        Some(PathElement::Fragment(name)) => {
+            if data.is_object_of_type(schema, name) {
+                // Note that (not unlike `Flatten`) we do not include the fragment in the `parent`
+                // path, because we want that path to be a "pure" response path. Fragments in path
+                // are used to essentially create a type-based choice in a "selection" path, but
+                // `parent` is a direct path to a specific position in the value and do not need
+                // fragments.
+                iterate_path_mut(schema, parent, &path[1..], data, f);
+            } else if let Value::Array(array) = data {
+                for (i, value) in array.iter_mut().enumerate() {
+                    parent.push(PathElement::Index(i));
+                    iterate_path_mut(schema, parent, path, value, f);
+                    parent.pop();
                 }
             }
         }
@@ -403,16 +815,35 @@ pub enum PathElement {
         deserialize_with = "deserialize_flatten",
         serialize_with = "serialize_flatten"
     )]
-    Flatten,
+    Flatten(Option<TypeConditions>),
 
     /// An index path element.
     Index(usize),
 
+    /// A fragment application
+    #[serde(
+        deserialize_with = "deserialize_fragment",
+        serialize_with = "serialize_fragment"
+    )]
+    Fragment(String),
+
     /// A key path element.
-    Key(String),
+    #[serde(deserialize_with = "deserialize_key", serialize_with = "serialize_key")]
+    Key(String, Option<TypeConditions>),
 }
 
-fn deserialize_flatten<'de, D>(deserializer: D) -> Result<(), D::Error>
+type TypeConditions = Vec<String>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResponsePathElement<'a> {
+    /// An index path element.
+    Index(usize),
+
+    /// A key path element.
+    Key(&'a str),
+}
+
+fn deserialize_flatten<'de, D>(deserializer: D) -> Result<Option<TypeConditions>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -422,18 +853,22 @@ where
 struct FlattenVisitor;
 
 impl<'de> serde::de::Visitor<'de> for FlattenVisitor {
-    type Value = ();
+    type Value = Option<TypeConditions>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        write!(formatter, "a string that is '@'")
+        write!(
+            formatter,
+            "a string that is '@', potentially followed by type conditions"
+        )
     }
 
     fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        if s == "@" {
-            Ok(())
+        let (path_element, type_conditions) = split_path_element_and_type_conditions(s);
+        if path_element == "@" {
+            Ok(type_conditions)
         } else {
             Err(serde::de::Error::invalid_value(
                 serde::de::Unexpected::Str(s),
@@ -443,11 +878,110 @@ impl<'de> serde::de::Visitor<'de> for FlattenVisitor {
     }
 }
 
-fn serialize_flatten<S>(serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_flatten<S>(
+    type_conditions: &Option<TypeConditions>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str("@")
+    let tc_string = if let Some(c) = type_conditions {
+        format!("|[{}]", c.join(","))
+    } else {
+        "".to_string()
+    };
+    let res = format!("@{}", tc_string);
+    serializer.serialize_str(res.as_str())
+}
+
+fn deserialize_key<'de, D>(deserializer: D) -> Result<(String, Option<TypeConditions>), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_str(KeyVisitor)
+}
+
+struct KeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for KeyVisitor {
+    type Value = (String, Option<TypeConditions>);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            formatter,
+            "a string, potentially followed by type conditions"
+        )
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(split_path_element_and_type_conditions(s))
+    }
+}
+
+fn serialize_key<S>(
+    key: &String,
+    type_conditions: &Option<TypeConditions>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let tc_string = if let Some(c) = type_conditions {
+        format!("|[{}]", c.join(","))
+    } else {
+        "".to_string()
+    };
+    let res = format!("{}{}", key, tc_string);
+    serializer.serialize_str(res.as_str())
+}
+
+fn deserialize_fragment<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_str(FragmentVisitor)
+}
+
+struct FragmentVisitor;
+
+impl<'de> serde::de::Visitor<'de> for FragmentVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "a string that begins with '... on '")
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        s.strip_prefix(FRAGMENT_PREFIX)
+            .map(|v| v.to_string())
+            .ok_or_else(|| serde::de::Error::invalid_value(serde::de::Unexpected::Str(s), &self))
+    }
+}
+
+fn serialize_fragment<S>(name: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(format!("{FRAGMENT_PREFIX}{name}").as_str())
+}
+
+fn flatten_from_str(s: &str) -> Result<PathElement, String> {
+    let (path_element, type_conditions) = split_path_element_and_type_conditions(s);
+    if path_element != "@" {
+        return Err("invalid flatten".to_string());
+    }
+    Ok(PathElement::Flatten(type_conditions))
+}
+
+fn key_from_str(s: &str) -> Result<PathElement, String> {
+    let (key, type_conditions) = split_path_element_and_type_conditions(s);
+    Ok(PathElement::Key(key, type_conditions))
 }
 
 /// A path into the result document.
@@ -465,11 +999,25 @@ impl Path {
                 .map(|s| {
                     if let Ok(index) = s.parse::<usize>() {
                         PathElement::Index(index)
-                    } else if s == "@" {
-                        PathElement::Flatten
+                    } else if s.contains('@') {
+                        flatten_from_str(s).unwrap_or(PathElement::Flatten(None))
                     } else {
-                        PathElement::Key(s.to_string())
+                        s.strip_prefix(FRAGMENT_PREFIX).map_or_else(
+                            || key_from_str(s).unwrap_or(PathElement::Key(s.to_string(), None)),
+                            |name| PathElement::Fragment(name.to_string()),
+                        )
                     }
+                })
+                .collect(),
+        )
+    }
+
+    pub fn from_response_slice(s: &[ResponsePathElement]) -> Self {
+        Self(
+            s.iter()
+                .map(|x| match x {
+                    ResponsePathElement::Index(index) => PathElement::Index(*index),
+                    ResponsePathElement::Key(s) => PathElement::Key(s.to_string(), None),
                 })
                 .collect(),
         )
@@ -506,6 +1054,52 @@ impl Path {
         new.extend(other.iter().cloned());
         Path(new)
     }
+
+    pub fn push(&mut self, element: PathElement) {
+        self.0.push(element)
+    }
+
+    pub fn pop(&mut self) -> Option<PathElement> {
+        self.0.pop()
+    }
+
+    pub fn last(&self) -> Option<&PathElement> {
+        self.0.last()
+    }
+
+    pub fn last_key(&mut self) -> Option<String> {
+        self.0.last().and_then(|elem| match elem {
+            PathElement::Key(key, type_conditions) => {
+                let mut tc = String::new();
+                if let Some(c) = type_conditions {
+                    tc = format!("|[{}]", c.join(","));
+                };
+                Some(format!("{}{}", key, tc))
+            }
+            _ => None,
+        })
+    }
+
+    pub fn starts_with(&self, other: &Path) -> bool {
+        self.0.starts_with(&other.0[..])
+    }
+
+    // Removes the empty key if at root (used for TypedConditions)
+    pub fn remove_empty_key_root(&self) -> Self {
+        if let Some(PathElement::Key(k, type_conditions)) = self.0.first() {
+            if k.is_empty() && type_conditions.is_none() {
+                return Path(self.iter().skip(1).cloned().collect());
+            }
+        }
+
+        self.clone()
+    }
+}
+
+impl FromIterator<PathElement> for Path {
+    fn from_iter<T: IntoIterator<Item = PathElement>>(iter: T) -> Self {
+        Path(iter.into_iter().collect())
+    }
 }
 
 impl AsRef<Path> for Path {
@@ -525,10 +1119,13 @@ where
                 .map(|s| {
                     if let Ok(index) = s.parse::<usize>() {
                         PathElement::Index(index)
-                    } else if s == "@" {
-                        PathElement::Flatten
+                    } else if s.contains('@') {
+                        flatten_from_str(s).unwrap()
                     } else {
-                        PathElement::Key(s.to_string())
+                        s.strip_prefix(FRAGMENT_PREFIX).map_or_else(
+                            || key_from_str(s).unwrap_or(PathElement::Key(s.to_string(), None)),
+                            |name| PathElement::Fragment(name.to_string()),
+                        )
                     }
                 })
                 .collect(),
@@ -541,9 +1138,22 @@ impl fmt::Display for Path {
         for element in self.iter() {
             write!(f, "/")?;
             match element {
-                PathElement::Index(index) => write!(f, "{}", index)?,
-                PathElement::Key(key) => write!(f, "{}", key)?,
-                PathElement::Flatten => write!(f, "@")?,
+                PathElement::Index(index) => write!(f, "{index}")?,
+                PathElement::Key(key, type_conditions) => {
+                    write!(f, "{key}")?;
+                    if let Some(c) = type_conditions {
+                        write!(f, "|[{}]", c.join(","))?;
+                    };
+                }
+                PathElement::Flatten(type_conditions) => {
+                    write!(f, "@")?;
+                    if let Some(c) = type_conditions {
+                        write!(f, "|[{}]", c.join(","))?;
+                    };
+                }
+                PathElement::Fragment(name) => {
+                    write!(f, "{FRAGMENT_PREFIX}{name}")?;
+                }
             }
         }
         Ok(())
@@ -568,9 +1178,60 @@ mod tests {
         };
     }
 
-    fn select_values<'a>(path: &'a Path, data: &'a Value) -> Result<Vec<&'a Value>, FetchError> {
+    /// Functions that walk on path needs a schema to handle potential fragment (type conditions) in
+    /// the path, and so we use the following simple schema for tests. Note however that tests that
+    /// don't use fragments in the path essentially ignore this schema.
+    fn test_schema() -> Schema {
+        Schema::parse(
+            r#"
+           schema
+             @link(url: "https://specs.apollo.dev/link/v1.0")
+             @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+           {
+             query: Query
+           }
+
+           directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+           directive @link( url: String as: String for: link__Purpose import: [link__Import]) repeatable on SCHEMA
+           scalar link__Import
+
+           enum join__Graph {
+             FAKE @join__graph(name:"fake" url: "http://localhost:4001/fake")
+           }
+
+           enum link__Purpose {
+             SECURITY
+             EXECUTION
+           }
+
+           type Query {
+             i: [I]
+           }
+
+           interface I {
+             x: Int
+           }
+
+           type A implements I {
+             x: Int
+           }
+
+           type B {
+             y: Int
+           }
+        "#,
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
+    fn select_values<'a>(
+        schema: &Schema,
+        path: &'a Path,
+        data: &'a Value,
+    ) -> Result<Vec<&'a Value>, FetchError> {
         let mut v = Vec::new();
-        data.select_values_and_paths(path, |_path, value| {
+        data.select_values_and_paths(schema, path, |_path, value| {
             v.push(value);
         });
         Ok(v)
@@ -578,22 +1239,25 @@ mod tests {
 
     #[test]
     fn test_get_at_path() {
+        let schema = test_schema();
         let json = json!({"obj":{"arr":[{"prop1":1},{"prop1":2}]}});
         let path = Path::from("obj/arr/1/prop1");
-        let result = select_values(&path, &json).unwrap();
+        let result = select_values(&schema, &path, &json).unwrap();
         assert_eq!(result, vec![&Value::Number(2.into())]);
     }
 
     #[test]
     fn test_get_at_path_flatmap() {
+        let schema = test_schema();
         let json = json!({"obj":{"arr":[{"prop1":1},{"prop1":2}]}});
         let path = Path::from("obj/arr/@");
-        let result = select_values(&path, &json).unwrap();
+        let result = select_values(&schema, &path, &json).unwrap();
         assert_eq!(result, vec![&json!({"prop1":1}), &json!({"prop1":2})]);
     }
 
     #[test]
     fn test_get_at_path_flatmap_nested() {
+        let schema = test_schema();
         let json = json!({
             "obj": {
                 "arr": [
@@ -613,7 +1277,7 @@ mod tests {
             },
         });
         let path = Path::from("obj/arr/@/prop1/@/prop2");
-        let result = select_values(&path, &json).unwrap();
+        let result = select_values(&schema, &path, &json).unwrap();
         assert_eq!(
             result,
             vec![
@@ -632,6 +1296,66 @@ mod tests {
         assert_eq!(
             json,
             json!({"obj":{"arr":[{"prop1":2, "prop3":3},{"prop2":2, "prop4":4}]}})
+        );
+    }
+
+    #[test]
+    fn interface_typename_merging() {
+        let schema = Schema::parse(
+                r#"
+            schema
+                @link(url: "https://specs.apollo.dev/link/v1.0")
+                @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+            {
+                query: Query
+            }
+            directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+            directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+            directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+            scalar link__Import
+            scalar join__FieldSet
+
+            enum link__Purpose {
+                SECURITY
+                EXECUTION
+            }
+
+            enum join__Graph {
+                TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+            }
+
+            interface I {
+                s: String
+            }
+
+            type C implements I {
+                s: String
+            }
+
+            type Query {
+                i: I
+            }
+        "#,
+            &Default::default(),
+        )
+        .expect("valid schema");
+        let mut response1 = json!({
+            "__typename": "C"
+        });
+        let response2 = json!({
+            "__typename": "I",
+            "s": "data"
+        });
+
+        response1.type_aware_deep_merge(response2, &schema);
+
+        assert_eq!(
+            response1,
+            json!({
+                "__typename": "C",
+                "s": "data"
+            })
         );
     }
 
@@ -708,5 +1432,97 @@ mod tests {
         let path = Path::from("obj/arr/@/obj2");
         let result = Value::from_path(&path, json);
         assert_eq!(result, json!({"obj":{"arr":null}}));
+    }
+
+    #[test]
+    fn test_is_object_of_type() {
+        let schema = test_schema();
+
+        // Basic matching
+        assert!(json!({ "__typename": "A", "x": "42"}).is_object_of_type(&schema, "A"));
+
+        // Matching with subtyping
+        assert!(json!({ "__typename": "A", "x": "42"}).is_object_of_type(&schema, "I"));
+
+        // Matching when missing __typename (see comment on the method declaration).
+        assert!(json!({ "x": "42"}).is_object_of_type(&schema, "A"));
+
+        // Non-matching because not an object
+        assert!(!json!([{ "__typename": "A", "x": "42"}]).is_object_of_type(&schema, "A"));
+        assert!(!json!("foo").is_object_of_type(&schema, "I"));
+        assert!(!json!(42).is_object_of_type(&schema, "I"));
+
+        // Non-matching because not of the asked type.
+        assert!(!json!({ "__typename": "B", "y": "42"}).is_object_of_type(&schema, "A"));
+        assert!(!json!({ "__typename": "B", "y": "42"}).is_object_of_type(&schema, "I"));
+    }
+
+    #[test]
+    fn test_get_at_path_with_conditions() {
+        let schema = test_schema();
+        let json = json!({
+            "i": [
+                {
+                    "__typename": "A",
+                    "x": 0,
+                },
+                {
+                    "__typename": "B",
+                    "y": 1,
+                },
+                {
+                    "__typename": "B",
+                    "y": 2,
+                },
+                {
+                    "__typename": "A",
+                    "x": 3,
+                },
+            ],
+        });
+        let path = Path::from("i/... on A");
+        let result = select_values(&schema, &path, &json).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                &json!({
+                    "__typename": "A",
+                    "x": 0,
+                }),
+                &json!({
+                    "__typename": "A",
+                    "x": 3,
+                }),
+            ],
+        );
+    }
+
+    #[test]
+    fn path_serde_json() {
+        let path: Path = serde_json::from_str(
+            r#"[
+            "k",
+            "... on T",
+            "@",
+            "arr",
+            3
+        ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            path.0,
+            vec![
+                PathElement::Key("k".to_string(), None),
+                PathElement::Fragment("T".to_string()),
+                PathElement::Flatten(None),
+                PathElement::Key("arr".to_string(), None),
+                PathElement::Index(3),
+            ]
+        );
+
+        assert_eq!(
+            serde_json::to_string(&path).unwrap(),
+            "[\"k\",\"... on T\",\"@\",\"arr\",3]",
+        );
     }
 }
